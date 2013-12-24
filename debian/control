@@ -2,9 +2,11 @@ Source: gawk
 Section: interpreters
 Priority: optional
 Build-Depends: debhelper (>= 7), quilt (>= 0.40), gettext, bison, libsigsegv-dev
-Maintainer: Arthur Loiret <aloiret@debian.org>
+Maintainer: Pexip AS <packaging@pexip.com>
+XSBC-Pexip-Original-Maintainer: Arthur Loiret <aloiret@debian.org>
 Standards-Version: 3.8.4
 Homepage: http://www.gnu.org/software/gawk/
+XS-Pexip-Upstream: http://archive.ubuntu.com/ubuntu/ precise
 
 Package: gawk
 Architecture: any
