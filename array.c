@@ -1,9 +1,9 @@
 /*
- * array.c - routines for associative arrays.
+ * array.c - routines for awk arrays.
  */
 
 /* 
- * Copyright (C) 1986, 1988, 1989, 1991-2010 the Free Software Foundation, Inc.
+ * Copyright (C) 1986, 1988, 1989, 1991-2014 the Free Software Foundation, Inc.
  * 
  * This file is part of GAWK, the GNU implementation of the
  * AWK Programming Language.
@@ -23,106 +23,218 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
  */
 
-/*
- * Tree walks (``for (iggy in foo)'') and array deletions use expensive
- * linear searching.  So what we do is start out with small arrays and
- * grow them as needed, so that our arrays are hopefully small enough,
- * most of the time, that they're pretty full and we're not looking at
- * wasted space.
- *
- * The decision is made to grow the array if the average chain length is
- * ``too big''. This is defined as the total number of entries in the table
- * divided by the size of the array being greater than some constant.
- *
- * 11/2002: We make the constant a variable, so that it can be tweaked
- * via environment variable.
- */
-
-static int AVG_CHAIN_MAX = 2;	/* 11/2002: Modern machines are bigger, cut this down from 10. */
-
 #include "awk.h"
 
-static NODE *assoc_find P((NODE *symbol, NODE *subs, unsigned long hash1));
-static void grow_table P((NODE *symbol));
+extern FILE *output_fp;
+extern NODE **fmt_list;          /* declared in eval.c */
 
-static unsigned long gst_hash_string P((const char *str, size_t len, unsigned long hsize, size_t *code));
-static unsigned long scramble P((unsigned long x));
-static unsigned long awk_hash P((const char *s, size_t len, unsigned long hsize, size_t *code));
+static size_t SUBSEPlen;
+static char *SUBSEP;
+static char indent_char[] = "    ";
 
-unsigned long (*hash)P((const char *s, size_t len, unsigned long hsize, size_t *code)) = awk_hash;
+static NODE **null_lookup(NODE *symbol, NODE *subs);
+static NODE **null_dump(NODE *symbol, NODE *subs);
+static afunc_t null_array_func[] = {
+	(afunc_t) 0,
+	(afunc_t) 0,
+	null_length,
+	null_lookup,
+	null_afunc,
+	null_afunc,
+	null_afunc,
+	null_afunc,
+	null_afunc,
+	null_dump,
+	(afunc_t) 0,
+};
 
-/* array_init --- possibly temporary function for experimentation purposes */
+#define MAX_ATYPE 10
+
+static afunc_t *array_types[MAX_ATYPE];
+static int num_array_types = 0;
+
+/* array func to index mapping */
+#define AFUNC(F) (F ## _ind)
+
+/* register_array_func --- add routines to handle arrays */
+
+int
+register_array_func(afunc_t *afunc)
+{
+	if (afunc && num_array_types < MAX_ATYPE) {
+		if (afunc != str_array_func && ! afunc[AFUNC(atypeof)])
+			return false;
+		array_types[num_array_types++] = afunc;
+		if (afunc[AFUNC(ainit)])	/* execute init routine if any */
+			(void) (*afunc[AFUNC(ainit)])(NULL, NULL);
+		return true;
+	}
+	return false;
+}
+
+
+/* array_init --- register all builtin array types */
 
 void
 array_init()
 {
-	const char *val;
-	int newval;
-
-	if ((val = getenv("AVG_CHAIN_MAX")) != NULL && isdigit(*val)) {
-		for (newval = 0; *val && isdigit(*val); val++)
-			newval = (newval * 10) + *val - '0';
-
-		AVG_CHAIN_MAX = newval;
+	(void) register_array_func(str_array_func);	/* the default */
+	if (! do_mpfr) {
+		(void) register_array_func(int_array_func);
+		(void) register_array_func(cint_array_func);
 	}
-
-	if ((val = getenv("AWK_HASH")) != NULL && strcmp(val, "gst") == 0)
-		hash = gst_hash_string; 
 }
 
-/*
- * get_actual --- proceed to the actual Node_var_array,
- *	change Node_var_new to an array.
- *	If canfatal and type isn't good, die fatally,
- *	otherwise return the final actual value.
- */
- 
+
+/* make_array --- create an array node */
+
 NODE *
-get_actual(NODE *symbol, int canfatal)
+make_array()
 {
-	int isparam = (symbol->type == Node_param_list
-			&& (symbol->flags & FUNC) == 0);
-	NODE *save_symbol = symbol;
+	NODE *array;
+	getnode(array);
+	memset(array, '\0', sizeof(NODE));
+	array->type = Node_var_array;
+	array->array_funcs = null_array_func;
+	/* vname, flags, and parent_array not set here */
 
-	if (isparam) {
-		save_symbol = symbol = stack_ptr[symbol->param_cnt];
-		if (symbol->type == Node_array_ref)
-			symbol = symbol->orig_array;
-	}
+	return array;
+}		
 
-	switch (symbol->type) {
-	case Node_var_new:
-		symbol->type = Node_var_array;
-		symbol->var_array = NULL;
-		/* fall through */
-	case Node_var_array:
-		break;
 
-	case Node_array_ref:
-	case Node_param_list:
-		if ((symbol->flags & FUNC) == 0)
-			cant_happen();
-		/* else
-			fall through */
+/* null_array --- force symbol to be an empty typeless array */
 
-	default:
-		/* notably Node_var but catches also e.g. FS[1] = "x" */
-		if (canfatal) {
-			if ((symbol->flags & FUNC) != 0)
-				fatal(_("attempt to use function `%s' as an array"),
-								save_symbol->vname);
-			else if (isparam)
-				fatal(_("attempt to use scalar parameter `%s' as an array"),
-								save_symbol->vname);
-			else
-				fatal(_("attempt to use scalar `%s' as array"),
-								save_symbol->vname);
-		} else
+void
+null_array(NODE *symbol)
+{
+	symbol->type = Node_var_array;
+	symbol->array_funcs = null_array_func;
+	symbol->buckets = NULL;
+	symbol->table_size = symbol->array_size = 0;
+	symbol->array_capacity = 0;
+	symbol->flags = 0;
+
+	assert(symbol->xarray == NULL);
+
+	/* vname, parent_array not (re)initialized */
+}
+
+
+/* null_lookup --- assign type to an empty array. */
+
+static NODE **
+null_lookup(NODE *symbol, NODE *subs)
+{
+	int i;
+	afunc_t *afunc = NULL;
+
+	assert(symbol->table_size == 0);
+
+	/*
+	 * Check which array type wants to accept this sub; traverse
+	 * array type list in reverse order.
+	 */
+	for (i = num_array_types - 1; i >= 1; i--) {
+		afunc = array_types[i];
+		if (afunc[AFUNC(atypeof)](symbol, subs) != NULL)
 			break;
 	}
+	if (i == 0 || afunc == NULL)
+		afunc = array_types[0];	/* default is str_array_func */
+	symbol->array_funcs = afunc;
 
-	return symbol;
+	/* We have the right type of array; install the subscript */
+	return symbol->alookup(symbol, subs);
 }
+
+/* null_length --- default function for array length interface */ 
+
+NODE **
+null_length(NODE *symbol, NODE *subs ATTRIBUTE_UNUSED)
+{
+	static NODE *tmp;
+	tmp = symbol;
+	return & tmp;
+}
+
+/* null_afunc --- default function for array interface */
+
+NODE **
+null_afunc(NODE *symbol ATTRIBUTE_UNUSED, NODE *subs ATTRIBUTE_UNUSED)
+{
+	return NULL;
+}
+
+/* null_dump --- dump function for an empty array */
+
+static NODE **
+null_dump(NODE *symbol, NODE *subs ATTRIBUTE_UNUSED)
+{
+	fprintf(output_fp, "array `%s' is empty\n", array_vname(symbol));
+	return NULL;
+}
+
+
+/* assoc_copy --- duplicate input array "symbol" */
+
+NODE *
+assoc_copy(NODE *symbol, NODE *newsymb)
+{
+	assert(newsymb->vname != NULL);
+
+	assoc_clear(newsymb);
+	(void) symbol->acopy(symbol, newsymb);
+	newsymb->array_funcs = symbol->array_funcs;
+	newsymb->flags = symbol->flags;
+	return newsymb;
+}
+
+
+/* assoc_dump --- dump array */
+
+void
+assoc_dump(NODE *symbol, NODE *ndump)
+{
+	if (symbol->adump)	
+		(void) symbol->adump(symbol, ndump);
+}
+
+
+/* make_aname --- construct a 'vname' for a (sub)array */
+
+const char *
+make_aname(const NODE *symbol)
+{
+	static char *aname = NULL;
+	static size_t alen;
+	static size_t max_alen;
+#define SLEN 256
+
+	if (symbol->parent_array != NULL) {
+		size_t slen;
+
+		(void) make_aname(symbol->parent_array);
+		slen = strlen(symbol->vname);	/* subscript in parent array */
+		if (alen + slen + 4 > max_alen) {		/* sizeof("[\"\"]") = 4 */
+			max_alen = alen + slen + 4 + SLEN;
+			erealloc(aname, char *, (max_alen + 1) * sizeof(char *), "make_aname");
+		}
+		alen += sprintf(aname + alen, "[\"%s\"]", symbol->vname);
+	} else {
+		alen = strlen(symbol->vname);
+		if (aname == NULL) {
+			max_alen = alen + SLEN;
+			emalloc(aname, char *, (max_alen + 1) * sizeof(char *), "make_aname");
+		} else if (alen > max_alen) {
+			max_alen = alen + SLEN; 
+			erealloc(aname, char *, (max_alen + 1) * sizeof(char *), "make_aname");
+		}
+		memcpy(aname, symbol->vname, alen + 1);
+	}
+	return aname;
+}
+#undef SLEN
+
 
 /*
  * array_vname --- print the name of the array
@@ -130,520 +242,383 @@ get_actual(NODE *symbol, int canfatal)
  * Returns a pointer to a statically maintained dynamically allocated string.
  * It's appropriate for printing the name once; if the caller wants
  * to save it, they have to make a copy.
- *
- * Setting MAX_LEN to a positive value (eg. 140) would limit the length
- * of the output to _roughly_ that length.
- *
- * If MAX_LEN == 0, which is the default, the whole stack is printed.
  */
-#define	MAX_LEN 0
 
-char *
-array_vname(register const NODE *symbol)
+const char *
+array_vname(const NODE *symbol)
 {
-	if (symbol->type == Node_param_list)
-		symbol = stack_ptr[symbol->param_cnt];
-
-	if (symbol->type != Node_array_ref || symbol->orig_array->type != Node_var_array)
-		return symbol->vname;
-	else {
-		static char *message = NULL;
-		static size_t msglen = 0;
-		char *s;
-		size_t len;
-		int n;
-		const NODE *save_symbol = symbol;
-		const char *from = _("from %s");
-
-#if (MAX_LEN <= 0) || !defined(HAVE_SNPRINTF)
-		/* This is the default branch. */
-
-		/* First, we have to compute the length of the string: */
-		len = strlen(symbol->vname) + 2;	/* "%s (" */
-		n = 0;
-		do {
-			symbol = symbol->prev_array;
-			len += strlen(symbol->vname);
-			n++;
-		} while	(symbol->type == Node_array_ref);
-		/*
-		 * Each node contributes by strlen(from) minus the length
-		 * of "%s" in the translation (which is at least 2)
-		 * plus 2 for ", " or ")\0"; this adds up to strlen(from).
-		 */
-		len += n * strlen(from);
-
-		/* (Re)allocate memory: */
-		if (message == NULL) {
-			emalloc(message, char *, len, "array_vname");
-			msglen = len;
-		} else if (len > msglen) {
-			erealloc(message, char *, len, "array_vname");
-			msglen = len;
-		} /* else
-			current buffer can hold new name */
-
-		/* We're ready to print: */
-		symbol = save_symbol;
-		s = message;
-		/*
-		 * Ancient systems have sprintf() returning char *, not int.
-		 * Thus, `s += sprintf(s, from, name);' is a no-no.
-		 */
-		sprintf(s, "%s (", symbol->vname);
-		s += strlen(s);
-		for (;;) {
-			symbol = symbol->prev_array;
-			sprintf(s, from, symbol->vname);
-			s += strlen(s);
-			if (symbol->type != Node_array_ref)
-				break;
-			sprintf(s, ", ");
-			s += strlen(s);
-		}
-		sprintf(s, ")");
-
-#else /* MAX_LEN > 0 */
-
-		/*
-		 * The following check fails only on
-		 * abnormally_long_variable_name.
-		 */
-#define PRINT_CHECK \
-		if (n <= 0 || n >= len) \
-			return save_symbol->vname; \
-		s += n; len -= n
-#define PRINT(str) \
-		n = snprintf(s, len, str); \
-		PRINT_CHECK
-#define PRINT_vname(str) \
-		n = snprintf(s, len, str, symbol->vname); \
-		PRINT_CHECK
-
-		if (message == NULL)
-			emalloc(message, char *, MAX_LEN, "array_vname");
-
-		s = message;
-		len = MAX_LEN;
-
-		/* First, print the vname of the node. */
-		PRINT_vname("%s (");
-
-		for (;;) {
-			symbol = symbol->prev_array;
-			/*
-			 * When we don't have enough space and this is not
-			 * the last node, shorten the list.
-			 */
-			if (len < 40 && symbol->type == Node_array_ref) {
-				PRINT("..., ");
-				symbol = symbol->orig_array;
-			}
-			PRINT_vname(from);
-			if (symbol->type != Node_array_ref)
-				break;
-			PRINT(", ");
-		}
-		PRINT(")");
-
-#undef PRINT_CHECK
-#undef PRINT
-#undef PRINT_vname
-#endif /* MAX_LEN <= 0 */
-
-		return message;
+	static char *message = NULL;
+	static size_t msglen = 0;
+	char *s;
+	size_t len;
+	int n;
+	const NODE *save_symbol = symbol;
+	const char *from = _("from %s");
+	const char *aname;
+	
+	if (symbol->type != Node_array_ref
+			|| symbol->orig_array->type != Node_var_array
+	) {
+		if (symbol->type != Node_var_array || symbol->parent_array == NULL)	
+			return symbol->vname;
+		return make_aname(symbol);
 	}
+
+	/* First, we have to compute the length of the string: */
+
+	len = 2; /* " (" */
+	n = 0;
+	while (symbol->type == Node_array_ref) {
+		len += strlen(symbol->vname);
+		n++;
+		symbol = symbol->prev_array;
+	}
+
+	/* Get the (sub)array name */
+	if (symbol->parent_array == NULL)
+		aname = symbol->vname;
+	else
+		aname = make_aname(symbol);
+	len += strlen(aname);
+	/*
+	 * Each node contributes by strlen(from) minus the length
+	 * of "%s" in the translation (which is at least 2)
+	 * plus 2 for ", " or ")\0"; this adds up to strlen(from).
+	 */
+	len += n * strlen(from);
+
+	/* (Re)allocate memory: */
+	if (message == NULL) {
+		emalloc(message, char *, len, "array_vname");
+		msglen = len;
+	} else if (len > msglen) {
+		erealloc(message, char *, len, "array_vname");
+		msglen = len;
+	} /* else
+		current buffer can hold new name */
+
+	/* We're ready to print: */
+	symbol = save_symbol;
+	s = message;
+	/*
+	 * Ancient systems have sprintf() returning char *, not int.
+	 * If you have one of those, use sprintf(..); s += strlen(s) instead.
+	 */
+
+	s += sprintf(s, "%s (", symbol->vname);
+	for (;;) {
+		symbol = symbol->prev_array;
+		if (symbol->type != Node_array_ref)
+			break;
+		s += sprintf(s, from, symbol->vname);
+		s += sprintf(s, ", ");
+	}
+	s += sprintf(s, from, aname);
+	strcpy(s, ")");
+
+	return message;
 }
-#undef MAX_LEN
+
+
+/*
+ *  force_array --- proceed to the actual Node_var_array,
+ *	change Node_var_new to an array.
+ *	If canfatal and type isn't good, die fatally,
+ *	otherwise return the final actual value.
+ */
+
+NODE *
+force_array(NODE *symbol, bool canfatal)
+{
+	NODE *save_symbol = symbol;
+	bool isparam = false;
+
+	if (symbol->type == Node_param_list) {
+		save_symbol = symbol = GET_PARAM(symbol->param_cnt);
+		isparam = true;
+		if (symbol->type == Node_array_ref)
+			symbol = symbol->orig_array;
+	}
+
+	switch (symbol->type) {
+	case Node_var_new:
+		symbol->xarray = NULL;	/* make sure union is as it should be */
+		null_array(symbol);
+		symbol->parent_array = NULL;	/* main array has no parent */
+		/* fall through */
+	case Node_var_array:
+		break;
+
+	case Node_array_ref:
+	default:
+		/* notably Node_var but catches also e.g. a[1] = "x"; a[1][1] = "y" */
+		if (canfatal) {
+			if (symbol->type == Node_val)
+				fatal(_("attempt to use a scalar value as array"));
+			if (isparam)
+				fatal(_("attempt to use scalar parameter `%s' as an array"),
+					save_symbol->vname);
+			else
+				fatal(_("attempt to use scalar `%s' as an array"),
+					save_symbol->vname);
+		} else
+			break;
+	}
+
+	return symbol;
+}
+
+
+/* set_SUBSEP --- update SUBSEP related variables when SUBSEP assigned to */
+                                
+void
+set_SUBSEP()
+{
+	SUBSEP_node->var_value = force_string(SUBSEP_node->var_value);
+	SUBSEP = SUBSEP_node->var_value->stptr;
+	SUBSEPlen = SUBSEP_node->var_value->stlen;
+}
+
 
 /* concat_exp --- concatenate expression list into a single string */
 
 NODE *
-concat_exp(register NODE *tree)
+concat_exp(int nargs, bool do_subsep)
 {
-	register NODE *r;
+	/* do_subsep is false for Op_concat */
+	NODE *r;
 	char *str;
 	char *s;
 	size_t len;
-	int offset;
-	size_t subseplen;
-	const char *subsep;
+	size_t subseplen = 0;
+	int i;
+	extern NODE **args_array;
+	
+	if (nargs == 1)
+		return POP_STRING();
 
-	if (tree->type != Node_expression_list)
-		return force_string(tree_eval(tree));
-	r = force_string(tree_eval(tree->lnode));
-	if (tree->rnode == NULL)
-		return r;
-	subseplen = SUBSEP_node->var_value->stlen;
-	subsep = SUBSEP_node->var_value->stptr;
-	len = r->stlen + subseplen + 2;
-	emalloc(str, char *, len, "concat_exp");
-	memcpy(str, r->stptr, r->stlen+1);
+	if (do_subsep)
+		subseplen = SUBSEPlen;
+
+	len = 0;
+	for (i = 1; i <= nargs; i++) {
+		r = TOP();
+		if (r->type == Node_var_array) {
+			while (--i > 0)
+				DEREF(args_array[i]);	/* avoid memory leak */
+			fatal(_("attempt to use array `%s' in a scalar context"), array_vname(r));
+		}
+		r = POP_STRING();
+		args_array[i] = r;
+		len += r->stlen;
+	}
+	len += (nargs - 1) * subseplen;
+
+	emalloc(str, char *, len + 2, "concat_exp");
+
+	r = args_array[nargs];
+	memcpy(str, r->stptr, r->stlen);
 	s = str + r->stlen;
-	free_temp(r);
-	for (tree = tree->rnode; tree != NULL; tree = tree->rnode) {
+	DEREF(r);
+	for (i = nargs - 1; i > 0; i--) {
 		if (subseplen == 1)
-			*s++ = *subsep;
-		else {
-			memcpy(s, subsep, subseplen+1);
+			*s++ = *SUBSEP;
+		else if (subseplen > 0) {
+			memcpy(s, SUBSEP, subseplen);
 			s += subseplen;
 		}
-		r = force_string(tree_eval(tree->lnode));
-		len += r->stlen + subseplen;
-		offset = s - str;
-		erealloc(str, char *, len, "concat_exp");
-		s = str + offset;
-		memcpy(s, r->stptr, r->stlen+1);
+		r = args_array[i];
+		memcpy(s, r->stptr, r->stlen);
 		s += r->stlen;
-		free_temp(r);
+		DEREF(r);
 	}
-	r = make_str_node(str, s - str, ALREADY_MALLOCED);
-	r->flags |= TEMP;
-	return r;
+
+	return make_str_node(str, len, ALREADY_MALLOCED);
 }
 
-/* assoc_clear --- flush all the values in symbol[] before doing a split() */
-
-void
-assoc_clear(NODE *symbol)
-{
-	long i;
-	NODE *bucket, *next;
-
-	if (symbol->var_array == NULL)
-		return;
-	for (i = 0; i < symbol->array_size; i++) {
-		for (bucket = symbol->var_array[i]; bucket != NULL; bucket = next) {
-			next = bucket->ahnext;
-			unref(bucket->ahvalue);
-			unref(bucket);	/* unref() will free the ahname_str */
-		}
-		symbol->var_array[i] = NULL;
-	}
-	free(symbol->var_array);
-	symbol->var_array = NULL;
-	symbol->array_size = symbol->table_size = 0;
-	symbol->flags &= ~ARRAYMAXED;
-}
-
-/* awk_hash --- calculate the hash function of the string in subs */
-
-static unsigned long
-awk_hash(register const char *s, register size_t len, unsigned long hsize, size_t *code)
-{
-	register unsigned long h = 0;
-
-	/*
-	 * This is INCREDIBLY ugly, but fast.  We break the string up into
-	 * 8 byte units.  On the first time through the loop we get the
-	 * "leftover bytes" (strlen % 8).  On every other iteration, we
-	 * perform 8 HASHC's so we handle all 8 bytes.  Essentially, this
-	 * saves us 7 cmp & branch instructions.  If this routine is
-	 * heavily used enough, it's worth the ugly coding.
-	 *
-	 * OZ's original sdbm hash, copied from Margo Seltzers db package.
-	 */
-
-	/*
-	 * Even more speed:
-	 * #define HASHC   h = *s++ + 65599 * h
-	 * Because 65599 = pow(2, 6) + pow(2, 16) - 1 we multiply by shifts
-	 */
-#define HASHC   htmp = (h << 6);  \
-		h = *s++ + htmp + (htmp << 10) - h
-
-	unsigned long htmp;
-
-	h = 0;
-
-#if defined(VAXC)
-	/*	
-	 * This was an implementation of "Duff's Device", but it has been
-	 * redone, separating the switch for extra iterations from the
-	 * loop. This is necessary because the DEC VAX-C compiler is
-	 * STOOPID.
-	 */
-	switch (len & (8 - 1)) {
-	case 7:		HASHC;
-	case 6:		HASHC;
-	case 5:		HASHC;
-	case 4:		HASHC;
-	case 3:		HASHC;
-	case 2:		HASHC;
-	case 1:		HASHC;
-	default:	break;
-	}
-
-	if (len > (8 - 1)) {
-		register size_t loop = len >> 3;
-		do {
-			HASHC;
-			HASHC;
-			HASHC;
-			HASHC;
-			HASHC;
-			HASHC;
-			HASHC;
-			HASHC;
-		} while (--loop);
-	}
-#else /* ! VAXC */
-	/* "Duff's Device" for those who can handle it */
-	if (len > 0) {
-		register size_t loop = (len + 8 - 1) >> 3;
-
-		switch (len & (8 - 1)) {
-		case 0:
-			do {	/* All fall throughs */
-				HASHC;
-		case 7:		HASHC;
-		case 6:		HASHC;
-		case 5:		HASHC;
-		case 4:		HASHC;
-		case 3:		HASHC;
-		case 2:		HASHC;
-		case 1:		HASHC;
-			} while (--loop);
-		}
-	}
-#endif /* ! VAXC */
-	if (code != NULL)
-		*code = h;
-
-	if (h >= hsize)
-		h %= hsize;
-	return h;
-}
-
-/* assoc_find --- locate symbol[subs] */
-
-static NODE *				/* NULL if not found */
-assoc_find(NODE *symbol, register NODE *subs, unsigned long hash1)
-{
-	register NODE *bucket;
-	const char *s1_str;
-	size_t s1_len;
-	NODE *s2;
-
-	for (bucket = symbol->var_array[hash1]; bucket != NULL;
-			bucket = bucket->ahnext) {
-		/*
-		 * This used to use cmp_nodes() here.  That's wrong.
-		 * Array indexes are strings; compare as such, always!
-		 */
-		s1_str = bucket->ahname_str;
-		s1_len = bucket->ahname_len;
-		s2 = subs;
-
-		if (s1_len == s2->stlen) {
-			if (s1_len == 0		/* "" is a valid index */
-			    || memcmp(s1_str, s2->stptr, s1_len) == 0)
-				return bucket;
-		}
-	}
-	return NULL;
-}
-
-/* in_array --- test whether the array element symbol[subs] exists or not,
- * 		return pointer to value if it does.
- */
-
-NODE *
-in_array(NODE *symbol, NODE *subs)
-{
-	register unsigned long hash1;
-	NODE *ret;
-
-	symbol = get_array(symbol);
-
-	/*
-	 * Evaluate subscript first, it could have side effects.
-	 */
-	subs = concat_exp(subs);	/* concat_exp returns a string node */
-	if (symbol->var_array == NULL) {
-		free_temp(subs);
-		return NULL;
-	}
-	hash1 = hash(subs->stptr, subs->stlen, (unsigned long) symbol->array_size, NULL);
-	ret = assoc_find(symbol, subs, hash1);
-	free_temp(subs);
-	if (ret)
-		return ret->ahvalue;
-	else
-		return NULL;
-}
 
 /*
- * assoc_lookup:
- * Find SYMBOL[SUBS] in the assoc array.  Install it with value "" if it
- * isn't there. Returns a pointer ala get_lhs to where its value is stored.
- *
- * SYMBOL is the address of the node (or other pointer) being dereferenced.
- * SUBS is a number or string used as the subscript. 
+ * adjust_fcall_stack: remove subarray(s) of symbol[] from
+ *	function call stack.
  */
 
-NODE **
-assoc_lookup(NODE *symbol, NODE *subs, int reference)
+static void
+adjust_fcall_stack(NODE *symbol, int nsubs)
 {
-	register unsigned long hash1;
-	register NODE *bucket;
-	size_t code;
-
-	assert(symbol->type == Node_var_array);
-
-	(void) force_string(subs);
-
-	if (symbol->var_array == NULL) {
-		symbol->array_size = symbol->table_size = 0;	/* sanity */
-		symbol->flags &= ~ARRAYMAXED;
-		grow_table(symbol);
-		hash1 = hash(subs->stptr, subs->stlen,
-				(unsigned long) symbol->array_size, & code);
-	} else {
-		hash1 = hash(subs->stptr, subs->stlen,
-				(unsigned long) symbol->array_size, & code);
-		bucket = assoc_find(symbol, subs, hash1);
-		if (bucket != NULL) {
-			free_temp(subs);
-			return &(bucket->ahvalue);
-		}
-	}
-
-	if (do_lint && reference) {
-		lintwarn(_("reference to uninitialized element `%s[\"%.*s\"]'"),
-		      array_vname(symbol), (int)subs->stlen, subs->stptr);
-	}
-
-	/* It's not there, install it. */
-	if (do_lint && subs->stlen == 0)
-		lintwarn(_("subscript of array `%s' is null string"),
-			array_vname(symbol));
-
-	/* first see if we would need to grow the array, before installing */
-	symbol->table_size++;
-	if ((symbol->flags & ARRAYMAXED) == 0
-	    && (symbol->table_size / symbol->array_size) > AVG_CHAIN_MAX) {
-		grow_table(symbol);
-		/* have to recompute hash value for new size */
-		hash1 = code % (unsigned long) symbol->array_size;
-	}
-
-	getnode(bucket);
-	bucket->type = Node_ahash;
+	NODE *func, *r, *n;
+	NODE **sp;
+	int pcount;
 
 	/*
-	 * Freeze this string value --- it must never
-	 * change, no matter what happens to the value
-	 * that created it or to CONVFMT, etc.
+	 * Solve the nasty problem of disappearing subarray arguments:
 	 *
-	 * One day: Use an atom table to track array indices,
-	 * and avoid the extra memory overhead.
+	 *  function f(c, d) { delete c; .. use non-existent array d .. }
+	 *  BEGIN { a[0][0] = 1; f(a, a[0]); .. }
+	 *
+	 * The fix is to convert 'd' to a local empty array; This has
+	 * to be done before clearing the parent array to avoid referring to
+	 * already free-ed memory.
+	 *
+	 * Similar situations exist for builtins accepting more than
+	 * one array argument: split, patsplit, asort and asorti. For example:
+	 *
+	 *  BEGIN { a[0][0] = 1; split("abc", a, "", a[0]) }
+	 *
+	 * These cases do not involve the function call stack, and are
+	 * handled individually in their respective routines.
 	 */
-	bucket->flags |= MALLOC;
-	bucket->ahname_ref = 1;
 
-	/* For TEMP node, reuse the storage directly */
-	if ((subs->flags & TEMP) != 0) {
-		bucket->ahname_str = subs->stptr;
-		bucket->ahname_len = subs->stlen;
-		bucket->ahname_str[bucket->ahname_len] = '\0';
-		subs->flags &= ~TEMP;   /* for good measure */
-		freenode(subs);
-	} else {
-		emalloc(bucket->ahname_str, char *, subs->stlen + 2, "assoc_lookup");
-		bucket->ahname_len = subs->stlen;
-		memcpy(bucket->ahname_str, subs->stptr, subs->stlen);
-		bucket->ahname_str[bucket->ahname_len] = '\0';
+	func = frame_ptr->func_node;
+	if (func == NULL)	/* in main */
+		return;
+	pcount = func->param_cnt;
+	sp = frame_ptr->stack;
+
+	for (; pcount > 0; pcount--) {
+		r = *sp++;
+		if (r->type != Node_array_ref
+				|| r->orig_array->type != Node_var_array)
+			continue;
+		n = r->orig_array;
+
+		/* Case 1 */
+		if (n == symbol
+			&& symbol->parent_array != NULL
+			&& nsubs > 0
+		) {
+			/*
+			 * 'symbol' is a subarray, and 'r' is the same subarray:
+			 *
+			 *   function f(c, d) { delete c[0]; .. }
+			 *   BEGIN { a[0][0] = 1; f(a, a[0]); .. }
+			 *
+			 * But excludes cases like (nsubs = 0):
+			 *
+			 *   function f(c, d) { delete c; ..}
+			 *   BEGIN { a[0][0] = 1; f(a[0], a[0]); ...}  
+			 */
+
+			null_array(r);
+			r->parent_array = NULL;
+			continue;
+		}			
+
+		/* Case 2 */
+		for (n = n->parent_array; n != NULL; n = n->parent_array) {
+			assert(n->type == Node_var_array);
+			if (n == symbol) {
+				/*
+				 * 'r' is a subarray of 'symbol':
+				 *
+				 *    function f(c, d) { delete c; .. use d as array .. }
+				 *    BEGIN { a[0][0] = 1; f(a, a[0]); .. }
+				 *	OR
+				 *    BEGIN { a[0][0][0][0] = 1; f(a[0], a[0][0][0]); .. }
+				 *
+				 */
+				null_array(r);
+				r->parent_array = NULL;
+				break;
+			}
+		}
 	}
-
-	bucket->ahvalue = Nnull_string;
-	bucket->ahnext = symbol->var_array[hash1];
-	bucket->ahcode = code;
-	symbol->var_array[hash1] = bucket;
-	return &(bucket->ahvalue);
 }
+
 
 /* do_delete --- perform `delete array[s]' */
 
 /*
  * `symbol' is array
- * `tree' is subscript
+ * `nsubs' is no of subscripts
  */
 
 void
-do_delete(NODE *sym, NODE *tree)
+do_delete(NODE *symbol, int nsubs)
 {
-	register unsigned long hash1;
-	register NODE *bucket, *last;
-	NODE *subs;
-	register NODE *symbol = get_array(sym);
+	NODE *val, *subs;
+	int i;
 
-	if (tree == NULL) {	/* delete array */
+	assert(symbol->type == Node_var_array);
+	subs = val = NULL;	/* silence the compiler */
+
+	/*
+	 * The force_string() call is needed to make sure that
+	 * the string subscript is reasonable.  For example, with it:
+	 *
+	 * $ ./gawk --posix 'BEGIN { CONVFMT="%ld"; delete a[1.233]}'
+	 * gawk: cmd. line:1: fatal: `%l' is not permitted in POSIX awk formats
+	 *
+	 * Without it, the code does not fail.
+	 */
+
+#define free_subs(n)    do {                                    \
+    NODE *s = PEEK(n - 1);                                      \
+    if (s->type == Node_val) {                                  \
+        (void) force_string(s);	/* may have side effects. */    \
+        DEREF(s);                                               \
+    }                                                           \
+} while (--n > 0)
+
+	if (nsubs == 0) {
+		/* delete array */
+
+		adjust_fcall_stack(symbol, 0);	/* fix function call stack; See above. */
 		assoc_clear(symbol);
 		return;
 	}
 
-	last = NULL;	/* shut up gcc -Wall */
-	hash1 = 0;	/* ditto */
+	/* NB: subscripts are in reverse order on stack */
 
-	/*
-	 * Always evaluate subscript, it could have side effects.
-	 */
-	subs = concat_exp(tree);	/* concat_exp returns string node */
-
-	if (symbol->var_array != NULL) {
-		hash1 = hash(subs->stptr, subs->stlen,
-				(unsigned long) symbol->array_size, NULL);
-		last = NULL;
-		for (bucket = symbol->var_array[hash1]; bucket != NULL;
-				last = bucket, bucket = bucket->ahnext) {
-			/*
-			 * This used to use cmp_nodes() here.  That's wrong.
-			 * Array indexes are strings; compare as such, always!
-			 */
-			const char *s1_str;
-			size_t s1_len;
-			NODE *s2;
-
-			s1_str = bucket->ahname_str;
-			s1_len = bucket->ahname_len;
-			s2 = subs;
-	
-			if (s1_len == s2->stlen) {
-				if (s1_len == 0		/* "" is a valid index */
-				    || memcmp(s1_str, s2->stptr, s1_len) == 0)
-					break;
-			}
+	for (i = nsubs; i > 0; i--) {
+		subs = PEEK(i - 1);
+		if (subs->type != Node_val) {
+			free_subs(i);
+			fatal(_("attempt to use array `%s' in a scalar context"), array_vname(subs));
 		}
+
+		val = in_array(symbol, subs);
+		if (val == NULL) {
+			if (do_lint) {
+				subs = force_string(subs);
+				lintwarn(_("delete: index `%s' not in array `%s'"),
+					subs->stptr, array_vname(symbol));
+			}
+			/* avoid memory leak, free all subs */
+			free_subs(i);
+			return;
+		}
+
+		if (i > 1) {
+			if (val->type != Node_var_array) {
+				/* e.g.: a[1] = 1; delete a[1][1] */
+
+				free_subs(i);
+				subs = force_string(subs);
+				fatal(_("attempt to use scalar `%s[\"%.*s\"]' as an array"),
+					array_vname(symbol),
+					(int) subs->stlen,
+					subs->stptr);
+			}
+			symbol = val;
+			DEREF(subs);
+		}
+	}
+
+	if (val->type == Node_var_array) {
+		adjust_fcall_stack(val, nsubs);  /* fix function call stack; See above. */
+		assoc_clear(val);
+		/* cleared a sub-array, free Node_var_array */
+		efree(val->vname);
+		freenode(val);
 	} else
-		bucket = NULL;	/* The array is empty.  */
+		unref(val);
 
-	if (bucket == NULL) {
-		if (do_lint)
-			lintwarn(_("delete: index `%s' not in array `%s'"),
-				subs->stptr, array_vname(sym));
-		free_temp(subs);
-		return;
-	}
+	(void) assoc_remove(symbol, subs);
+	DEREF(subs);
 
-	free_temp(subs);
-
-	if (last != NULL)
-		last->ahnext = bucket->ahnext;
-	else
-		symbol->var_array[hash1] = bucket->ahnext;
-	unref(bucket->ahvalue);
-	unref(bucket);	/* unref() will free the ahname_str */
-	symbol->table_size--;
-	if (symbol->table_size <= 0) {
-		memset(symbol->var_array, '\0',
-			sizeof(NODE *) * symbol->array_size);
-		symbol->table_size = symbol->array_size = 0;
-		symbol->flags &= ~ARRAYMAXED;
-		free((char *) symbol->var_array);
-		symbol->var_array = NULL;
-	}
+#undef free_subs
 }
+
 
 /* do_delete_loop --- simulate ``for (iggy in foo) delete foo[iggy]'' */
 
@@ -654,567 +629,746 @@ do_delete(NODE *sym, NODE *tree)
  */
 
 void
-do_delete_loop(NODE *symbol, NODE *tree)
+do_delete_loop(NODE *symbol, NODE **lhs)
 {
-	long i;
-	NODE **lhs;
-	Func_ptr after_assign = NULL;
+	NODE **list;
+	NODE akind;
 
-	symbol = get_array(symbol);
+	akind.flags = AINDEX|ADELETE;	/* need a single index */
+	list = symbol->alist(symbol, & akind);
 
-	if (symbol->var_array == NULL)
+	if (assoc_empty(symbol))
 		return;
 
-	/* get first index value */
-	for (i = 0; i < symbol->array_size; i++) {
-		if (symbol->var_array[i] != NULL) {
-			lhs = get_lhs(tree->lnode, & after_assign, FALSE);
-			unref(*lhs);
-			*lhs = make_string(symbol->var_array[i]->ahname_str,
-					symbol->var_array[i]->ahname_len);
-			if (after_assign)
-				(*after_assign)();
-			break;
-		}
-	}
+	unref(*lhs);
+	*lhs = list[0];
+	efree(list);
 
 	/* blast the array in one shot */
+	adjust_fcall_stack(symbol, 0);	
 	assoc_clear(symbol);
 }
 
-/* grow_table --- grow a hash table */
+
+/* value_info --- print scalar node info */
 
 static void
-grow_table(NODE *symbol)
+value_info(NODE *n)
 {
-	NODE **old, **new, *chain, *next;
-	int i, j;
-	unsigned long hash1;
-	unsigned long oldsize, newsize, k;
-	/*
-	 * This is an array of primes. We grow the table by an order of
-	 * magnitude each time (not just doubling) so that growing is a
-	 * rare operation. We expect, on average, that it won't happen
-	 * more than twice.  The final size is also chosen to be small
-	 * enough so that MS-DOG mallocs can handle it. When things are
-	 * very large (> 8K), we just double more or less, instead of
-	 * just jumping from 8K to 64K.
-	 */
-	static const long sizes[] = { 13, 127, 1021, 8191, 16381, 32749, 65497,
-#if ! defined(MSDOS) && ! defined(OS2) && ! defined(atarist)
-				131101, 262147, 524309, 1048583, 2097169,
-				4194319, 8388617, 16777259, 33554467, 
-				67108879, 134217757, 268435459, 536870923,
-				1073741827
-#endif
-	};
 
-	/* find next biggest hash size */
-	newsize = oldsize = symbol->array_size;
-	for (i = 0, j = sizeof(sizes)/sizeof(sizes[0]); i < j; i++) {
-		if (oldsize < sizes[i]) {
-			newsize = sizes[i];
-			break;
-		}
-	}
+#define PREC_NUM -1
+#define PREC_STR -1
 
-	if (newsize == oldsize) {	/* table already at max (!) */
-		symbol->flags |= ARRAYMAXED;
+	if (n == Nnull_string || n == Null_field) {
+		fprintf(output_fp, "<(null)>");
 		return;
 	}
 
-	/* allocate new table */
-	emalloc(new, NODE **, newsize * sizeof(NODE *), "grow_table");
-	memset(new, '\0', newsize * sizeof(NODE *));
-
-	/* brand new hash table, set things up and return */
-	if (symbol->var_array == NULL) {
-		symbol->table_size = 0;
-		goto done;
-	}
-
-	/* old hash table there, move stuff to new, free old */
-	old = symbol->var_array;
-	for (k = 0; k < oldsize; k++) {
-		if (old[k] == NULL)
-			continue;
-
-		for (chain = old[k]; chain != NULL; chain = next) {
-			next = chain->ahnext;
-			hash1 = chain->ahcode % newsize;
-
-			/* remove from old list, add to new */
-			chain->ahnext = new[hash1];
-			new[hash1] = chain;
+	if ((n->flags & (STRING|STRCUR)) != 0) {
+		fprintf(output_fp, "<");
+		fprintf(output_fp, "\"%.*s\"", PREC_STR, n->stptr);
+		if ((n->flags & (NUMBER|NUMCUR)) != 0) {
+#ifdef HAVE_MPFR
+			if (is_mpg_float(n))
+				fprintf(output_fp, ":%s",
+					mpg_fmt("%.*R*g", PREC_NUM, ROUND_MODE, n->mpg_numbr));
+			else if (is_mpg_integer(n))
+				fprintf(output_fp, ":%s", mpg_fmt("%Zd", n->mpg_i));
+			else
+#endif
+			fprintf(output_fp, ":%.*g", PREC_NUM, n->numbr);
 		}
+		fprintf(output_fp, ">");
+	} else {
+#ifdef HAVE_MPFR
+		if (is_mpg_float(n))
+			fprintf(output_fp, "<%s>",
+				mpg_fmt("%.*R*g", PREC_NUM, ROUND_MODE, n->mpg_numbr));
+		else if (is_mpg_integer(n))
+			fprintf(output_fp, "<%s>", mpg_fmt("%Zd", n->mpg_i));
+		else
+#endif
+		fprintf(output_fp, "<%.*g>", PREC_NUM, n->numbr);
 	}
-	free(old);
 
-done:
-	/*
-	 * note that symbol->table_size does not change if an old array,
-	 * and is explicitly set to 0 if a new one.
-	 */
-	symbol->var_array = new;
-	symbol->array_size = newsize;
+	fprintf(output_fp, ":%s", flags2str(n->flags));
+
+	if ((n->flags & FIELD) == 0)
+		fprintf(output_fp, ":%ld", n->valref);
+	else
+		fprintf(output_fp, ":");
+
+	if ((n->flags & (STRING|STRCUR)) == STRCUR) {
+		fprintf(output_fp, "][");
+		fprintf(output_fp, "stfmt=%d, ", n->stfmt);	
+		fprintf(output_fp, "CONVFMT=\"%s\"", n->stfmt <= -1 ? "%ld"
+					: fmt_list[n->stfmt]->stptr);
+	}
+
+#undef PREC_NUM
+#undef PREC_STR
 }
 
-/* set_SUBSEP --- make sure SUBSEP always has a string value */
 
 void
-set_SUBSEP(void)
+indent(int indent_level)
 {
-
-	(void) force_string(SUBSEP_node->var_value);
-	return;
+	int i;
+	for (i = 0; i < indent_level; i++)
+		fprintf(output_fp, "%s", indent_char);
 }
 
-/* pr_node --- print simple node info */
+/* assoc_info --- print index, value info */
 
-static void
-pr_node(NODE *n)
+void
+assoc_info(NODE *subs, NODE *val, NODE *ndump, const char *aname)
 {
-	if ((n->flags & (NUMCUR|NUMBER)) != 0)
-		printf("%g", n->numbr);
+	int indent_level = ndump->alevel;
+
+	indent_level++;
+	indent(indent_level);
+	fprintf(output_fp, "I: [%s:", aname);
+	if ((subs->flags & (MPFN|MPZN|INTIND)) == INTIND)
+		fprintf(output_fp, "<%ld>", (long) subs->numbr);
 	else
-		printf("%.*s", (int) n->stlen, n->stptr);
+		value_info(subs);
+	fprintf(output_fp, "]\n");
+
+	indent(indent_level);
+	if (val->type == Node_val) {
+		fprintf(output_fp, "V: [scalar: ");
+		value_info(val);
+	} else {
+		fprintf(output_fp, "V: [");
+		ndump->alevel++;
+		ndump->adepth--;
+		assoc_dump(val, ndump);
+		ndump->adepth++;
+		ndump->alevel--;
+		indent(indent_level);
+	}
+	fprintf(output_fp, "]\n");
 }
 
-/* assoc_dump --- dump the contents of an array */
-
-NODE *
-assoc_dump(NODE *symbol)
-{
-	long i;
-	NODE *bucket;
-
-	if (symbol->var_array == NULL) {
-		printf(_("%s: empty (null)\n"), symbol->vname);
-		return tmp_number((AWKNUM) 0);
-	}
-
-	if (symbol->table_size == 0) {
-		printf(_("%s: empty (zero)\n"), symbol->vname);
-		return tmp_number((AWKNUM) 0);
-	}
-
-	printf(_("%s: table_size = %d, array_size = %d\n"), symbol->vname,
-			(int) symbol->table_size, (int) symbol->array_size);
-
-	for (i = 0; i < symbol->array_size; i++) {
-		for (bucket = symbol->var_array[i]; bucket != NULL;
-				bucket = bucket->ahnext) {
-			printf("%s: I: [len %d <%.*s>] V: [",
-				symbol->vname,
-				(int) bucket->ahname_len,
-				(int) bucket->ahname_len,
-				bucket->ahname_str);
-			pr_node(bucket->ahvalue);
-			printf("]\n");
-		}
-	}
-
-	return tmp_number((AWKNUM) 0);
-}
 
 /* do_adump --- dump an array: interface to assoc_dump */
 
 NODE *
-do_adump(NODE *tree)
+do_adump(int nargs)
 {
-	NODE *r, *a;
-
-	a = tree->lnode;
-
-	if (a->type == Node_param_list) {
-		printf(_("%s: is parameter\n"), a->vname);
-		a = stack_ptr[a->param_cnt];
-	}
-
-	if (a->type == Node_array_ref) {
-		printf(_("%s: array_ref to %s\n"), a->vname,
-					a->orig_array->vname);
-		a = a->orig_array;
-	}
-
-	r = assoc_dump(a);
-
-	return r;
-}
-
-/*
- * The following functions implement the builtin
- * asort function.  Initial work by Alan J. Broder,
- * ajb@woti.com.
- */
-
-/* dup_table --- duplicate input symbol table "symbol" */
-
-static void
-dup_table(NODE *symbol, NODE *newsymb)
-{
-	NODE **old, **new, *chain, *bucket;
-	long i;
-	unsigned long cursize;
-
-	/* find the current hash size */
-	cursize = symbol->array_size;
-
-	new = NULL;
-
-	/* input is a brand new hash table, so there's nothing to copy */
-	if (symbol->var_array == NULL)
-		newsymb->table_size = 0;
-	else {
-		/* old hash table there, dupnode stuff into a new table */
-
-		/* allocate new table */
-		emalloc(new, NODE **, cursize * sizeof(NODE *), "dup_table");
-		memset(new, '\0', cursize * sizeof(NODE *));
-
-		/* do the copying/dupnode'ing */
-		old = symbol->var_array;
-		for (i = 0; i < cursize; i++) {
-			if (old[i] != NULL) {
-				for (chain = old[i]; chain != NULL;
-						chain = chain->ahnext) {
-					/* get a node for the linked list */
-					getnode(bucket);
-					bucket->type = Node_ahash;
-					bucket->flags |= MALLOC;
-					bucket->ahname_ref = 1;
-
-					/*
-					 * copy the corresponding name and
-					 * value from the original input list
-					 */
-					emalloc(bucket->ahname_str, char *, chain->ahname_len + 2, "dup_table");
-					bucket->ahname_len = chain->ahname_len;
-
-					memcpy(bucket->ahname_str, chain->ahname_str, chain->ahname_len);
-					bucket->ahname_str[bucket->ahname_len] = '\0';
-
-					bucket->ahvalue = dupnode(chain->ahvalue);
-
-					/*
-					 * put the node on the corresponding
-					 * linked list in the new table
-					 */
-					bucket->ahnext = new[i];
-					new[i] = bucket;
-				}
-			}
-		}
-		newsymb->table_size = symbol->table_size;
-	}
-
-	newsymb->var_array = new;
-	newsymb->array_size = cursize;
-}
-
-/* merge --- do a merge of two sorted lists */
-
-static NODE *
-merge(NODE *left, NODE *right)
-{
-	NODE *ans, *cur;
+	NODE *symbol, *tmp;
+	static NODE ndump;
+	long depth = 0;
 
 	/*
-	 * The use of cmp_nodes() here means that IGNORECASE influences the
-	 * comparison.  This is OK, but it may be surprising.  This comment
-	 * serves to remind us that we know about this and that it's OK.
+	 * depth < 0, no index and value info.
+	 *       = 0, main array index and value info; does not descend into sub-arrays.
+	 *       > 0, descends into 'depth' sub-arrays, and prints index and value info.
 	 */
-	if (cmp_nodes(left->ahvalue, right->ahvalue) <= 0) {
-		ans = cur = left;
-		left = left->ahnext;
-	} else {
-		ans = cur = right;
-		right = right->ahnext;
+
+	if (nargs == 2) {
+		tmp = POP_NUMBER();
+		depth = get_number_si(tmp);
+		DEREF(tmp);
 	}
+	symbol = POP_PARAM();
+	if (symbol->type != Node_var_array)
+		fatal(_("adump: first argument not an array"));
 
-	while (left != NULL && right != NULL) {
-		if (cmp_nodes(left->ahvalue, right->ahvalue) <= 0) {
-			cur->ahnext = left;
-			cur = left;
-			left  = left->ahnext;
-		} else {
-			cur->ahnext = right;
-			cur = right;
-			right = right->ahnext;
-		}
-	}
-
-	cur->ahnext = (left != NULL ? left : right);
-
-	return ans;
+	ndump.type = Node_dump_array;
+	ndump.adepth = depth;
+	ndump.alevel = 0;
+	assoc_dump(symbol, & ndump);
+	return make_number((AWKNUM) 0);
 }
 
-/* merge_sort --- recursively sort the left and right sides of a list */
-
-static NODE *
-merge_sort(NODE *left, unsigned long size)
-{
-	NODE *right, *tmp;
-	int i, half;
-
-	if (size <= 1)
-		return left;
-
-	/* walk down the list, till just one before the midpoint */
-	tmp = left;
-	half = size / 2;
-	for (i = 0; i < half-1; i++)
-		tmp = tmp->ahnext;
-
-	/* split the list into two parts */
-	right = tmp->ahnext;
-	tmp->ahnext = NULL;
-
-	/* sort the left and right parts of the list */
-	left  = merge_sort(left,       half);
-	right = merge_sort(right, size-half);
-
-	/* merge the two sorted parts of the list */
-	return merge(left, right);
-}
-
-
-/*
- * assoc_from_list -- Populate an array with the contents of a list of NODEs, 
- * using increasing integers as the key.
- */
-
-static void
-assoc_from_list(NODE *symbol, NODE *list)
-{
-	NODE *next;
-	unsigned long i = 0;
-	register unsigned long hash1;
-	char buf[100];
-
-	for (; list != NULL; list = next) {
-		size_t code;
-
-		next = list->ahnext;
-
-		/* make an int out of i++ */
-		i++;
-		sprintf(buf, "%lu", i);
-		assert(list->ahname_str == NULL);
-		assert(list->ahname_ref == 1);
-		emalloc(list->ahname_str, char *, strlen(buf) + 2, "assoc_from_list");
-		list->ahname_len = strlen(buf);
-		strcpy(list->ahname_str, buf);
-
-		/* find the bucket where it belongs */
-		hash1 = hash(list->ahname_str, list->ahname_len,
-				symbol->array_size, & code);
-		list->ahcode = code;
-
-		/* link the node into the chain at that bucket */
-		list->ahnext = symbol->var_array[hash1];
-		symbol->var_array[hash1] = list;
-	}
-}
-
-/*
- * assoc_sort_inplace --- sort all the values in symbol[], replacing
- * the sorted values back into symbol[], indexed by integers starting with 1.
- */
-
-typedef enum asort_how { VALUE, INDEX } ASORT_TYPE;
-
-static NODE *
-assoc_sort_inplace(NODE *symbol, ASORT_TYPE how)
-{
-	unsigned long i, num;
-	NODE *bucket, *next, *list;
-
-	if (symbol->var_array == NULL
-	    || symbol->array_size <= 0
-	    || symbol->table_size <= 0)
-		return tmp_number((AWKNUM) 0);
-
-	/* build a linked list out of all the entries in the table */
-	if (how == VALUE) {
-		list = NULL;
-		num = 0;
-		for (i = 0; i < symbol->array_size; i++) {
-			for (bucket = symbol->var_array[i]; bucket != NULL; bucket = next) {
-				next = bucket->ahnext;
-				if (bucket->ahname_ref == 1) {
-					free(bucket->ahname_str);
-					bucket->ahname_str = NULL;
-					bucket->ahname_len = 0;
-				} else {
-					NODE *r;
-
-					getnode(r);
-					*r = *bucket;
-					unref(bucket);
-					bucket = r;
-					bucket->flags |= MALLOC;
-					bucket->ahname_ref = 1;
-					bucket->ahname_str = NULL;
-					bucket->ahname_len = 0;
-				}
-				bucket->ahnext = list;
-				list = bucket;
-				num++;
-			}
-			symbol->var_array[i] = NULL;
-		}
-	} else {	/* how == INDEX */
-		list = NULL;
-		num = 0;
-		for (i = 0; i < symbol->array_size; i++) {
-			for (bucket = symbol->var_array[i]; bucket != NULL; bucket = next) {
-				next = bucket->ahnext;
-
-				/* toss old value */
-				unref(bucket->ahvalue);
-
-				/* move index into value */
-				if (bucket->ahname_ref == 1) {
-					bucket->ahvalue = make_str_node(bucket->ahname_str,
-								bucket->ahname_len, ALREADY_MALLOCED);
-					bucket->ahname_str = NULL;
-					bucket->ahname_len = 0;
-				} else {
-					NODE *r;
-
-					bucket->ahvalue = make_string(bucket->ahname_str, bucket->ahname_len);
-					getnode(r);
-					*r = *bucket;
-					unref(bucket);
-					bucket = r;
-					bucket->flags |= MALLOC;
-					bucket->ahname_ref = 1;
-					bucket->ahname_str = NULL;
-					bucket->ahname_len = 0;
-				}
-
-				bucket->ahnext = list;
-				list = bucket;
-				num++;
-			}
-			symbol->var_array[i] = NULL;
-		}
-	}
-
-	/*
-	 * Sort the linked list of NODEs.
-	 * (The especially nice thing about using a merge sort here is that
-	 * we require absolutely no additional storage. This is handy if the
-	 * array has grown to be very large.)
-	 */
-	list = merge_sort(list, num);
-
-	/*
-	 * now repopulate the original array, using increasing
-	 * integers as the key
-	 */
-	assoc_from_list(symbol, list);
-
-	return tmp_number((AWKNUM) num);
-}
 
 /* asort_actual --- do the actual work to sort the input array */
 
 static NODE *
-asort_actual(NODE *tree, ASORT_TYPE how)
+asort_actual(int nargs, sort_context_t ctxt)
 {
-	NODE *array = get_array(tree->lnode);
+	NODE *array, *dest = NULL, *result;
+	NODE *r, *subs, *s;
+	NODE **list = NULL, **ptr, **lhs;
+	unsigned long num_elems, i;
+	const char *sort_str;
 
-	if (tree->rnode != NULL) {  /* 2nd optional arg */
-		NODE *dest = get_array(tree->rnode->lnode);
+	if (nargs == 3)  /* 3rd optional arg */
+		s = POP_STRING();
+	else
+		s = dupnode(Nnull_string);	/* "" => default sorting */
 
-		assoc_clear(dest);
-		dup_table(array, dest);
-		array = dest;
+	s = force_string(s);
+	sort_str = s->stptr;
+	if (s->stlen == 0) {		/* default sorting */
+		if (ctxt == ASORT)
+			sort_str = "@val_type_asc";
+		else
+			sort_str = "@ind_str_asc";
 	}
 
-	return assoc_sort_inplace(array, how);
+	if (nargs >= 2) {  /* 2nd optional arg */
+		dest = POP_PARAM();
+		if (dest->type != Node_var_array) {
+			fatal(ctxt == ASORT ?
+				_("asort: second argument not an array") :
+				_("asorti: second argument not an array"));
+		}
+	}
+
+	array = POP_PARAM();
+	if (array->type != Node_var_array) {
+		fatal(ctxt == ASORT ?
+			_("asort: first argument not an array") :
+			_("asorti: first argument not an array"));
+	}
+
+	if (dest != NULL) {
+		for (r = dest->parent_array; r != NULL; r = r->parent_array) {
+			if (r == array)
+				fatal(ctxt == ASORT ?
+					_("asort: cannot use a subarray of first arg for second arg") :
+					_("asorti: cannot use a subarray of first arg for second arg"));
+		}
+		for (r = array->parent_array; r != NULL; r = r->parent_array) {
+			if (r == dest)
+				fatal(ctxt == ASORT ?
+					_("asort: cannot use a subarray of second arg for first arg") :
+					_("asorti: cannot use a subarray of second arg for first arg"));
+		}
+	}
+
+	/* sorting happens inside assoc_list */
+	list = assoc_list(array, sort_str, ctxt);
+	DEREF(s);
+
+	num_elems = assoc_length(array);
+	if (num_elems == 0 || list == NULL) {
+ 		/* source array is empty */
+ 		if (dest != NULL && dest != array)
+ 			assoc_clear(dest);
+		if (list != NULL)
+			efree(list);
+ 		return make_number((AWKNUM) 0);
+ 	}
+
+	/*
+	 * Must not assoc_clear() the source array before constructing
+	 * the output array. assoc_list() does not duplicate array values
+	 * which are needed for asort().
+	 */
+
+	if (dest != NULL && dest != array) {
+		assoc_clear(dest);
+		result = dest;
+	} else {
+		/* use 'result' as a temporary destination array */
+		result = make_array();
+		result->vname = array->vname;
+		result->parent_array = array->parent_array;
+	}
+
+	if (ctxt == ASORTI) {
+		/* We want the indices of the source array. */
+
+		for (i = 1, ptr = list; i <= num_elems; i++, ptr += 2) {
+			subs = make_number(i);
+			lhs = assoc_lookup(result, subs);
+			unref(*lhs);
+			*lhs = *ptr;
+			if (result->astore != NULL)
+				(*result->astore)(result, subs);
+			unref(subs);
+		}
+	} else {
+		/* We want the values of the source array. */
+
+		for (i = 1, ptr = list; i <= num_elems; i++) {
+			subs = make_number(i);
+
+			/* free index node */
+			r = *ptr++;
+			unref(r);
+
+			/* value node */
+			r = *ptr++;
+
+			if (r->type == Node_val) {
+				lhs = assoc_lookup(result, subs);
+				unref(*lhs);
+				*lhs = dupnode(r);
+			} else {
+				NODE *arr;
+				arr = make_array();
+				subs = force_string(subs);
+				arr->vname = subs->stptr;
+				subs->stptr = NULL;
+				subs->flags &= ~STRCUR;
+				arr->parent_array = array; /* actual parent, not the temporary one. */
+				lhs = assoc_lookup(result, subs);
+				unref(*lhs);
+				*lhs = assoc_copy(r, arr);
+			}
+			if (result->astore != NULL)
+				(*result->astore)(result, subs);
+			unref(subs);
+		}
+	}
+
+	efree(list);
+
+	if (result != dest) {
+		/* dest == NULL or dest == array */
+		assoc_clear(array);
+		*array = *result;	/* copy result into array */
+		freenode(result);
+	} /* else
+		result == dest
+		dest != NULL and dest != array */
+
+	return make_number((AWKNUM) num_elems);
 }
 
 /* do_asort --- sort array by value */
 
 NODE *
-do_asort(NODE *tree)
+do_asort(int nargs)
 {
-	return asort_actual(tree, VALUE);
+	return asort_actual(nargs, ASORT);
 }
 
 /* do_asorti --- sort array by index */
 
 NODE *
-do_asorti(NODE *tree)
+do_asorti(int nargs)
 {
-	return asort_actual(tree, INDEX);
+	return asort_actual(nargs, ASORTI);
 }
 
+
 /*
-From bonzini@gnu.org  Mon Oct 28 16:05:26 2002
-Date: Mon, 28 Oct 2002 13:33:03 +0100
-From: Paolo Bonzini <bonzini@gnu.org>
-To: arnold@skeeve.com
-Subject: Hash function
-Message-ID: <20021028123303.GA6832@biancaneve>
-
-Here is the hash function I'm using in GNU Smalltalk.  The scrambling is
-needed if you use powers of two as the table sizes.  If you use primes it
-is not needed.
-
-To use double-hashing with power-of-two size, you should use the
-_gst_hash_string(str, len) as the primary hash and
-scramble(_gst_hash_string (str, len)) | 1 as the secondary hash.
-
-Paolo
-
-*/
-/*
- * ADR: Slightly modified to work w/in the context of gawk.
+ * cmp_strings --- compare two strings; logic similar to cmp_nodes() in eval.c
+ *	except the extra case-sensitive comparison when the case-insensitive
+ *	result is a match.
  */
 
-static unsigned long
-gst_hash_string(const char *str, size_t len, unsigned long hsize, size_t *code)
+static int
+cmp_strings(const NODE *n1, const NODE *n2)
 {
-	unsigned long hashVal = 1497032417;    /* arbitrary value */
-	unsigned long ret;
+	char *s1, *s2;
+	size_t len1, len2;
+	int ret;
+	size_t lmin;
 
-	while (len--) {
-		hashVal += *str++;
-		hashVal += (hashVal << 10);
-		hashVal ^= (hashVal >> 6);
+	s1 = n1->stptr;
+	len1 = n1->stlen;
+	s2 =  n2->stptr;
+	len2 = n2->stlen;
+
+	if (len1 == 0)
+		return len2 == 0 ? 0 : -1;
+	if (len2 == 0)
+		return 1;
+
+	/* len1 > 0 && len2 > 0 */
+	lmin = len1 < len2 ? len1 : len2;
+
+	if (IGNORECASE) {
+		const unsigned char *cp1 = (const unsigned char *) s1;
+		const unsigned char *cp2 = (const unsigned char *) s2;
+
+#if MBS_SUPPORT
+		if (gawk_mb_cur_max > 1) {
+			ret = strncasecmpmbs((const unsigned char *) cp1,
+					     (const unsigned char *) cp2, lmin);
+		} else
+#endif
+		for (ret = 0; lmin-- > 0 && ret == 0; cp1++, cp2++)
+			ret = casetable[*cp1] - casetable[*cp2];
+		if (ret != 0)
+			return ret;
+		/*
+		 * If case insensitive result is "they're the same",
+		 * use case sensitive comparison to force distinct order.
+		 */
 	}
 
-	ret = scramble(hashVal);
+	ret = memcmp(s1, s2, lmin);
+	if (ret != 0 || len1 == len2)
+		return ret;
+	return (len1 < len2) ? -1 : 1;
+}
 
-	if (code != NULL)
-		*code = ret;
+/* sort_up_index_string --- qsort comparison function; ascending index strings. */
 
-	if (ret >= hsize)
-		ret %= hsize;
+static int
+sort_up_index_string(const void *p1, const void *p2)
+{
+	const NODE *t1, *t2;
 
+	/* Array indices are strings */
+	t1 = *((const NODE *const *) p1);
+	t2 = *((const NODE *const *) p2);
+	return cmp_strings(t1, t2);
+}
+
+
+/* sort_down_index_str --- qsort comparison function; descending index strings. */
+
+static int
+sort_down_index_string(const void *p1, const void *p2)
+{
+	/*
+	 * Negation versus transposed arguments:  when all keys are
+	 * distinct, as with array indices here, either method will
+	 * transform an ascending sort into a descending one.  But if
+	 * there are equal keys--such as when IGNORECASE is honored--
+	 * that get disambiguated into a determisitc order, negation
+	 * will reverse those but transposed arguments would retain
+	 * their relative order within the rest of the reversed sort.
+	 */
+	return -sort_up_index_string(p1, p2);
+}
+
+
+/* sort_up_index_number --- qsort comparison function; ascending index numbers. */
+
+static int
+sort_up_index_number(const void *p1, const void *p2)
+{
+	const NODE *t1, *t2;
+	int ret;
+
+	t1 = *((const NODE *const *) p1);
+	t2 = *((const NODE *const *) p2);
+
+	ret = cmp_numbers(t1, t2);
+	if (ret != 0)
+		return ret; 
+
+	/* break a tie with the index string itself */
+	t1 = force_string((NODE *) t1);
+	t2 = force_string((NODE *) t2);
+	return cmp_strings(t1, t2);
+}
+
+/* sort_down_index_number --- qsort comparison function; descending index numbers */
+
+static int
+sort_down_index_number(const void *p1, const void *p2)
+{
+	return -sort_up_index_number(p1, p2);
+}
+
+
+/* sort_up_value_string --- qsort comparison function; ascending value string */
+
+static int
+sort_up_value_string(const void *p1, const void *p2)
+{
+	const NODE *t1, *t2;
+
+	t1 = *((const NODE *const *) p1 + 1);
+	t2 = *((const NODE *const *) p2 + 1);
+
+	if (t1->type == Node_var_array) {
+		/* return 0 if t2 is a sub-array too, else return 1 */
+		return (t2->type != Node_var_array);
+	}
+	if (t2->type == Node_var_array)
+		return -1;		/* t1 (scalar) < t2 (sub-array) */
+
+	/* t1 and t2 both have string values */
+	return cmp_strings(t1, t2);
+}
+
+
+/* sort_down_value_string --- qsort comparison function; descending value string */
+
+static int
+sort_down_value_string(const void *p1, const void *p2)
+{
+	return -sort_up_value_string(p1, p2);
+}
+
+
+/* sort_up_value_number --- qsort comparison function; ascending value number */
+
+static int
+sort_up_value_number(const void *p1, const void *p2)
+{
+	NODE *t1, *t2;
+	int ret;
+
+	t1 = *((NODE *const *) p1 + 1);
+	t2 = *((NODE *const *) p2 + 1);
+
+	if (t1->type == Node_var_array) {
+		/* return 0 if t2 is a sub-array too, else return 1 */
+		return (t2->type != Node_var_array);
+	}
+	if (t2->type == Node_var_array)
+		return -1;		/* t1 (scalar) < t2 (sub-array) */
+
+	ret = cmp_numbers(t1, t2);
+	if (ret != 0)
+		return ret;
+
+	/*
+	 * Use string value to guarantee same sort order on all
+	 * versions of qsort().
+	 */
+	t1 = force_string(t1);
+	t2 = force_string(t2);
+	return cmp_strings(t1, t2);
+}
+
+
+/* sort_down_value_number --- qsort comparison function; descending value number */
+
+static int
+sort_down_value_number(const void *p1, const void *p2)
+{
+	return -sort_up_value_number(p1, p2);
+}
+
+
+/* sort_up_value_type --- qsort comparison function; ascending value type */
+
+static int
+sort_up_value_type(const void *p1, const void *p2)
+{
+	NODE *n1, *n2;
+
+	/* we want to compare the element values */
+	n1 = *((NODE *const *) p1 + 1);
+	n2 = *((NODE *const *) p2 + 1);
+
+	/* 1. Arrays vs. scalar, scalar is less than array */
+	if (n1->type == Node_var_array) {
+		/* return 0 if n2 is a sub-array too, else return 1 */
+		return (n2->type != Node_var_array);
+	}
+	if (n2->type == Node_var_array) {
+		return -1;		/* n1 (scalar) < n2 (sub-array) */
+	}
+
+	/* two scalars */
+	/* 2. Resolve MAYBE_NUM, so that have only NUMBER or STRING */
+	if ((n1->flags & MAYBE_NUM) != 0)
+		(void) force_number(n1);
+	if ((n2->flags & MAYBE_NUM) != 0)
+		(void) force_number(n2);
+
+	/* 2.5. Resolve INTIND, so that is STRING, and not NUMBER */
+	if ((n1->flags & INTIND) != 0)
+		(void) force_string(n1);
+	if ((n2->flags & INTIND) != 0)
+		(void) force_string(n2);
+
+	if ((n1->flags & NUMBER) != 0 && (n2->flags & NUMBER) != 0) {
+		return cmp_numbers(n1, n2);
+	}
+
+	/* 3. All numbers are less than all strings. This is aribitrary. */
+	if ((n1->flags & NUMBER) != 0 && (n2->flags & STRING) != 0) {
+		return -1;
+	} else if ((n1->flags & STRING) != 0 && (n2->flags & NUMBER) != 0) {
+		return 1;
+	}
+
+	/* 4. Two strings */
+	return cmp_strings(n1, n2);
+}
+
+/* sort_down_value_type --- qsort comparison function; descending value type */
+
+static int
+sort_down_value_type(const void *p1, const void *p2)
+{
+	return -sort_up_value_type(p1, p2);
+}
+
+/* sort_user_func --- user defined qsort comparison function */
+
+static int
+sort_user_func(const void *p1, const void *p2)
+{
+	NODE *idx1, *idx2, *val1, *val2, *r;
+	int ret;
+	INSTRUCTION *code;
+
+	idx1 = *((NODE *const *) p1);
+	idx2 = *((NODE *const *) p2);
+	val1 = *((NODE *const *) p1 + 1);
+	val2 = *((NODE *const *) p2 + 1);
+
+	code = TOP()->code_ptr;	/* comparison function call instructions */
+
+	/* setup 4 arguments to comp_func() */
+	UPREF(idx1);
+	PUSH(idx1);
+	if (val1->type == Node_val)
+		UPREF(val1);
+	PUSH(val1);
+
+	UPREF(idx2);
+	PUSH(idx2);
+	if (val2->type == Node_val)
+		UPREF(val2);
+	PUSH(val2);
+
+	/* execute the comparison function */
+	(void) (*interpret)(code);
+
+	/* return value of the comparison function */
+	r = POP_NUMBER();
+#ifdef HAVE_MPFR
+	/*
+	 * mpfr_sgn(mpz_sgn): Returns a positive value if op > 0,
+	 * zero if op = 0, and a negative value if op < 0.
+	 */
+	if (is_mpg_float(r))
+		ret = mpfr_sgn(r->mpg_numbr);
+	else if (is_mpg_integer(r))
+		ret = mpz_sgn(r->mpg_i);
+	else
+#endif
+		ret = (r->numbr < 0.0) ? -1 : (r->numbr > 0.0);
+	DEREF(r);
 	return ret;
 }
 
-static unsigned long
-scramble(unsigned long x)
-{
-	if (sizeof(long) == 4) {
-		int y = ~x;
 
-		x += (y << 10) | (y >> 22);
-		x += (x << 6)  | (x >> 26);
-		x -= (x << 16) | (x >> 16);
-	} else {
-		x ^= (~x) >> 31;
-		x += (x << 21) | (x >> 11);
-		x += (x << 5) | (x >> 27);
-		x += (x << 27) | (x >> 5);
-		x += (x << 31);
+/* assoc_list -- construct, and optionally sort, a list of array elements */  
+
+NODE **
+assoc_list(NODE *symbol, const char *sort_str, sort_context_t sort_ctxt)
+{
+	typedef int (*qsort_compfunc)(const void *, const void *);
+
+	static const struct qsort_funcs {
+		const char *name;
+		qsort_compfunc comp_func;
+		assoc_kind_t kind;
+	} sort_funcs[] = {
+{ "@ind_str_asc",	sort_up_index_string,	AINDEX|AISTR|AASC },
+{ "@ind_num_asc",	sort_up_index_number,	AINDEX|AINUM|AASC },
+{ "@val_str_asc",	sort_up_value_string,	AVALUE|AVSTR|AASC },
+{ "@val_num_asc",	sort_up_value_number,	AVALUE|AVNUM|AASC },
+{ "@ind_str_desc",	sort_down_index_string,	AINDEX|AISTR|ADESC },
+{ "@ind_num_desc",	sort_down_index_number,	AINDEX|AINUM|ADESC },
+{ "@val_str_desc",	sort_down_value_string,	AVALUE|AVSTR|ADESC },
+{ "@val_num_desc",	sort_down_value_number,	AVALUE|AVNUM|ADESC },
+{ "@val_type_asc",	sort_up_value_type,	AVALUE|AASC },
+{ "@val_type_desc",	sort_down_value_type,	AVALUE|ADESC },
+{ "@unsorted",		0,			AINDEX },
+};
+
+	/*
+	 * N.B.: AASC and ADESC are hints to the specific array types.
+	 *	See cint_list() in cint_array.c.
+	 */
+
+	NODE **list;
+	NODE akind;
+	unsigned long num_elems, j;
+	int elem_size, qi;
+	qsort_compfunc cmp_func = 0;
+	INSTRUCTION *code = NULL;
+	extern int currule;
+	int save_rule = 0;
+	assoc_kind_t assoc_kind = ANONE;
+	
+	elem_size = 1;
+
+	for (qi = 0, j = sizeof(sort_funcs)/sizeof(sort_funcs[0]); qi < j; qi++) {
+		if (strcmp(sort_funcs[qi].name, sort_str) == 0)
+			break;
 	}
 
-	return x;
+	if (qi < j) {
+		cmp_func = sort_funcs[qi].comp_func;
+		assoc_kind = sort_funcs[qi].kind;
+
+		if (symbol->array_funcs != cint_array_func)
+			assoc_kind &= ~(AASC|ADESC);
+
+		if (sort_ctxt != SORTED_IN || (assoc_kind & AVALUE) != 0) {
+			/* need index and value pair in the list */
+
+			assoc_kind |= (AINDEX|AVALUE);
+			elem_size = 2;
+		}
+
+	} else {	/* unrecognized */
+		NODE *f;
+		const char *sp;	
+
+		for (sp = sort_str; *sp != '\0' && ! isspace((unsigned char) *sp); sp++)
+			continue;
+
+		/* empty string or string with space(s) not valid as function name */
+		if (sp == sort_str || *sp != '\0')
+			fatal(_("`%s' is invalid as a function name"), sort_str);
+
+		f = lookup(sort_str);
+		if (f == NULL || f->type != Node_func)
+			fatal(_("sort comparison function `%s' is not defined"), sort_str);
+
+		cmp_func = sort_user_func;
+
+		/* need index and value pair in the list */
+		assoc_kind |= (AVALUE|AINDEX);
+		elem_size = 2;
+
+		/* make function call instructions */
+		code = bcalloc(Op_func_call, 2, 0);
+		code->func_body = f;
+		code->func_name = NULL;		/* not needed, func_body already assigned */
+		(code + 1)->expr_count = 4;	/* function takes 4 arguments */
+		code->nexti = bcalloc(Op_stop, 1, 0);	
+
+		/*
+		 * make non-redirected getline, exit, `next' and `nextfile' fatal in
+		 * callback function by setting currule in interpret()
+		 * to undefined (0).
+		 */
+
+		save_rule = currule;	/* save current rule */
+		currule = 0;
+
+		PUSH_CODE(code);
+	}
+
+	akind.flags = (unsigned int) assoc_kind;	/* kludge */
+	list = symbol->alist(symbol, & akind);
+	assoc_kind = (assoc_kind_t) akind.flags;	/* symbol->alist can modify it */
+
+	if (list == NULL || ! cmp_func || (assoc_kind & (AASC|ADESC)) != 0)
+		return list;	/* empty list or unsorted, or list already sorted */
+
+	num_elems = assoc_length(symbol);
+
+	qsort(list, num_elems, elem_size * sizeof(NODE *), cmp_func); /* shazzam! */
+
+	if (cmp_func == sort_user_func) {
+		code = POP_CODE();
+		currule = save_rule;            /* restore current rule */ 
+		bcfree(code->nexti);            /* Op_stop */
+		bcfree(code);                   /* Op_func_call */
+	}
+
+	if (sort_ctxt == SORTED_IN && (assoc_kind & (AINDEX|AVALUE)) == (AINDEX|AVALUE)) {
+		/* relocate all index nodes to the first half of the list. */
+		for (j = 1; j < num_elems; j++)
+			list[j] = list[2 * j];
+
+		/* give back extra memory */
+
+		erealloc(list, NODE **, num_elems * sizeof(NODE *), "assoc_list");
+	}
+
+	return list;
 }

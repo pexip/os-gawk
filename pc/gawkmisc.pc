@@ -3,7 +3,7 @@
  */
 
 /* 
- * Copyright (C) 1986, 1988, 1989, 1991 - 2003 the Free Software Foundation, Inc.
+ * Copyright (C) 1986, 1988, 1989, 1991 - 2003, 2012 the Free Software Foundation, Inc.
  * 
  * This file is part of GAWK, the GNU implementation of the
  * AWK Progamming Language.
@@ -31,6 +31,8 @@ char *defpath = DEFPATH;
 # else
 char *defpath = ".;c:\\lib\\awk;c:\\gnu\\lib\\awk";
 # endif
+/* the Makefile should define DEFLIBPATH */
+char *deflibpath = DEFLIBPATH;
 
 #ifdef __EMX__
 #include<io.h>
@@ -38,6 +40,24 @@ char *defpath = ".;c:\\lib\\awk;c:\\gnu\\lib\\awk";
 static int _os2_is_abs_path(const char *dirname);
 static char* _os2_unixroot(const char *path);
 static const char* _os2_unixroot_path(const char *path);
+#endif
+
+#ifdef __MINGW32__
+#ifdef HAVE_SOCKETS
+#include <socket.h>
+
+#undef socket
+#undef setsockopt
+#undef bind
+#undef connect
+#undef listen
+#undef accept
+#undef recvfrom
+#undef shutdown
+#endif
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #endif
 
 /* gawk_name --- pull out the "gawk" part from how the OS called us */
@@ -203,15 +223,19 @@ os_close_on_exec(fd, name, what, dir)
 int fd;
 const char *name, *what, *dir;
 {
-#if ! defined(_MSC_VER) && ! defined(__MINGW32__)
-# if (defined(__DJGPP__) && (__DJGPP__ > 2 || __DJGPP_MINOR__ >= 4)) || defined __EMX__
+#if (defined(__DJGPP__) && (__DJGPP__ > 2 || __DJGPP_MINOR__ >= 4)) || defined __EMX__
 	if (fd <= 2)	/* sanity */
 		return;
 
 	if (fcntl(fd, F_SETFD, 1) < 0)
 		warning("%s %s `%s': could not set close-on-exec: %s",
 			what, dir, name, strerror(errno));
-# endif
+#endif
+#ifdef __MINGW32__
+	HANDLE fh = (HANDLE)_get_osfhandle(fd);
+
+	if (fh && fh != INVALID_HANDLE_VALUE)
+		SetHandleInformation(fh, HANDLE_FLAG_INHERIT, 0);
 #endif
 }
 
@@ -228,6 +252,31 @@ int fd;
 	struct stat sbuf;
 
 	return (fstat(fd, &sbuf) == 0 && S_ISDIR(sbuf.st_mode));
+}
+
+/* os_isreadable --- fd can be read from */
+
+int
+os_isreadable(const awk_input_buf_t *iobuf, bool *isdir)
+{
+	*isdir = false;
+
+	switch (iobuf->sbuf.st_mode & S_IFMT) {
+	case S_IFREG:
+	case S_IFCHR:	/* ttys, /dev/null, .. */
+#ifdef S_IFSOCK
+	case S_IFSOCK:
+#endif
+#ifdef S_IFIFO
+	case S_IFIFO:
+#endif
+		return true;
+	case S_IFDIR:
+		*isdir = true;
+		/* fall through */
+	default:
+		return false;
+	}
 }
 
 /* os_is_setuid --- true if running setuid root */
@@ -279,6 +328,53 @@ int fd;
 	if (orig_tty_mode != -1) {
 		setmode(fd, orig_tty_mode);
 	}
+}
+
+/* os_isatty --- return true if fd is a tty */
+
+int
+os_isatty(int fd)
+{
+#if defined(__MINGW32__) || defined(_MSC_VER)
+	return (isatty(fd) && lseek(fd, SEEK_CUR, 0) == -1);
+#else
+	return isatty(fd);
+#endif
+}
+ 
+/* files_are_same --- return true if files are identical */
+
+int
+files_are_same(char *path, SRCFILE *src)
+{
+	struct stat st;
+	size_t pathlen;
+	char *p, *s;
+
+	if (stat (path, & st) == 0) {
+		/* If they have a working `stat', honor that.  */
+		if (!(st.st_dev == src->sbuf.st_dev
+		      && st.st_ino == src->sbuf.st_ino))
+			return 0;
+
+		/* Compare modification times.  */
+		if (st.st_mtime != src->mtime)
+			return 0;
+
+		/* Compare absolute file names case-insensitively, and
+		   treat forward- and back-slashes as equal.  */
+		pathlen = strlen(path);
+		for (p = path, s = src->fullpath;
+		     p <= path + pathlen;
+		     p++, s++) {
+			if (tolower(*p) != tolower(*s)
+			    && !((*p == '/' || *p == '\\')
+				 && (*s == '/' || *s == '\\')))
+				return 0;
+		}
+		return 1;
+	}
+	return 0;
 }
 
 
@@ -453,3 +549,341 @@ _os2_unixroot_path(const char *path)
   return (result) ? (const char*) result : path;
 }
 #endif /* __EMX__ */
+
+#ifdef __MINGW32__
+
+extern void *xmalloc (size_t);
+
+int
+setenv (const char *name, const char *value, int rewrite)
+{
+  char *entry;
+
+  if (*value == '=')
+    ++value;
+
+  if (getenv (name) && !rewrite)
+    return 0;
+
+  entry = xmalloc (strlen (name) + 1 + strlen (value) + 1);
+  strcat (strcat (strcpy (entry, name), "="), value);
+  if (putenv (entry) != 0)
+    {
+      free (entry);
+      return -1;
+    }
+  return 0;
+}
+
+int
+unsetenv (const char *name)
+{
+  if (!name || !*name || strchr (name, '=') != NULL)
+    return -1;
+
+  return setenv (name, "", 1);
+}
+
+int
+usleep(unsigned int usec)
+{
+  double msecf = usec / 1000.0;
+
+  Sleep ((DWORD)msecf);
+
+  return usec - msecf * 1000 < 0 ? 0 : (int)(usec - msecf * 1000);
+}
+
+/* The implementation of wctob in the MS runtime is problematic
+   because it doesn't allow to distinguish between WEOF and 0xff, due
+   to integer sign extension.  It also causes failures in dfa.c when
+   characters with the 8th bit set are involved.  This replacement
+   version fixes that.  */
+
+#include <wchar.h>
+
+int
+wctob (wint_t wc)
+{
+  char buf[64];
+
+  if (!(MB_CUR_MAX <= sizeof (buf)))
+    abort ();
+  /* Handle the case where WEOF is a value that does not fit in a wchar_t.  */
+  if (wc == (wchar_t)wc)
+    if (wctomb (buf, (wchar_t)wc) == 1)
+      return (unsigned char) buf[0];
+  return EOF;
+}
+
+/*
+ * On MS-Windows with MinGW, execvp causes the shell and the re-exec'ed
+ * dgawk to compete for the keyboard input.
+ *
+ * This will need work if we ever need a real version of execvp.
+ */
+int execvp(const char *file, const char *const *argv)
+{
+	if (_spawnvp(_P_WAIT, file, (const char * const *)argv) != -1)
+		exit(EXIT_SUCCESS);
+
+	return -1;
+}
+
+#ifdef DYNAMIC
+
+#include <dlfcn.h>
+
+static DWORD last_err;
+
+void *
+dlopen (const char *file, int mode)
+{
+  char dllfn[MAX_PATH], *p;
+  HANDLE dllhandle;
+
+  if (mode != RTLD_LAZY)
+    {
+      errno = EINVAL;
+      last_err = ERROR_INVALID_PARAMETER;
+      return NULL;
+    }
+
+  /* MSDN says to be sure to use backslashes in the DLL file name.  */
+  strcpy (dllfn, file);
+  for (p = dllfn; *p; p++)
+    if (*p == '/')
+      *p = '\\';
+
+  dllhandle = LoadLibrary (dllfn);
+  if (!dllhandle)
+    last_err = GetLastError ();
+
+  return dllhandle;
+}
+
+char *
+dlerror (void)
+{
+  static char errbuf[1024];
+  DWORD ret;
+
+  if (!last_err)
+    return NULL;
+
+  ret = FormatMessage (FORMAT_MESSAGE_FROM_SYSTEM
+		       | FORMAT_MESSAGE_IGNORE_INSERTS,
+		       NULL, last_err, 0, errbuf, sizeof (errbuf), NULL);
+  while (ret > 0 && (errbuf[ret - 1] == '\n' || errbuf[ret - 1] == '\r'))
+    --ret;
+
+  errbuf[ret] = '\0';
+  if (!ret)
+    sprintf (errbuf, "Error code %lu", last_err);
+
+  last_err = 0;
+  return errbuf;
+}
+
+int
+dlclose (void *handle)
+{
+  if (!handle || handle == INVALID_HANDLE_VALUE)
+    return -1;
+  if (!FreeLibrary (handle))
+    return -1;
+
+  return 0;
+}
+
+void *
+dlsym (void *handle, const char *name)
+{
+  FARPROC addr = NULL;
+
+  if (!handle || handle == INVALID_HANDLE_VALUE)
+    {
+      last_err = ERROR_INVALID_PARAMETER;
+      return NULL;
+    }
+
+  addr = GetProcAddress (handle, name);
+  if (!addr)
+    last_err = GetLastError ();
+
+  return (void *)addr;
+}
+#endif	/* DYNAMIC */
+
+#ifdef HAVE_SOCKETS
+int
+socket_to_fd(SOCKET s)
+{
+  return (s == INVALID_SOCKET
+	  ? INVALID_HANDLE
+	  : _open_osfhandle (s, O_BINARY | O_NOINHERIT));
+}
+
+int
+w32_socket(int family, int type, int protocol)
+{
+  /* We need to use WSASocket rather than socket, since the latter
+     creates overlapped sockets that cannot be used in file I/O
+     APIs.  */
+  SOCKET s = WSASocket (family, type, protocol, NULL, 0, 0);
+
+  if (s == INVALID_SOCKET)
+    {
+      switch (WSAGetLastError ())
+	{
+	  case WSAEMFILE:
+	    errno = EMFILE;
+	    break;
+	  case WSANOTINITIALISED:
+	  case WSAENETDOWN:
+	    errno = EACCES;
+	    break;
+	  case WSAENOBUFS:
+	    errno = ENOMEM;
+	    break;
+	  case WSAEFAULT:
+	    errno = EFAULT;
+	    break;
+	  default:
+	    errno = EINVAL;
+	    break;
+	}
+    }
+
+  return socket_to_fd (s);
+}
+
+int
+w32_setsockopt (int fd, int level, int optname, const char *optval, int optlen)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+
+  return setsockopt (s, level, optname, optval, optlen);
+}
+
+int
+w32_bind (int fd, const struct sockaddr *name, int namelen)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+
+  return bind (s, name, namelen);
+}
+
+int
+w32_connect (int fd, const struct sockaddr *name, int namelen)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+
+  return connect (s, name, namelen);
+}
+
+int
+w32_listen (int fd, int backlog)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+
+  return listen (s, backlog);
+}
+
+int
+w32_accept (int fd, struct sockaddr *addr, int *addrlen)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+
+  return socket_to_fd (accept (s, addr, addrlen));
+}
+
+SOCKET
+valid_socket (int fd)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+  int ov, ol = 4;
+
+  if (s == INVALID_SOCKET
+      || (getsockopt (s, SOL_SOCKET, SO_TYPE, (char *)&ov, &ol) == SOCKET_ERROR
+	  && WSAGetLastError() == WSAENOTSOCK))
+    return (SOCKET)0;
+  return s;
+}
+
+int
+w32_closesocket (int fd)
+{
+  SOCKET s = valid_socket (fd);
+  int res1, res2 = 0;
+
+  if (!s && fd == FAKE_FD_VALUE)
+    return 0;
+
+  res1 = close (fd);
+  if (s)
+    res2 = closesocket (s);
+
+  if (res1 == -1 || res2 == SOCKET_ERROR)
+    return -1;
+  return 0;
+}
+
+int
+w32_recvfrom (int fd, char *buf, int len, int flags,
+	      struct sockaddr *from, int *fromlen)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+
+  return recvfrom (s, buf, len, flags, from, fromlen);
+}
+
+int
+w32_shutdown (int fd, int how)
+{
+  SOCKET s = FD_TO_SOCKET (fd);
+
+  return shutdown (s, how);
+}
+
+#endif	/* HAVE_SOCKETS */
+
+#endif	/* __MINGW32__ */
+
+#if defined(__DJGPP__) || defined(__MINGW32__)
+
+void
+init_sockets(void)
+{
+#ifdef HAVE_SOCKETS
+  WSADATA  winsockData;
+  int errcode;
+
+  if ((errcode = WSAStartup (0x101, &winsockData)) != 0
+      || winsockData.wVersion != 0x101)
+    fatal(_("cannot start Winsock (%d)"), errcode);
+#endif
+}
+
+#endif	/* __DJGPP__ || __MINGW32__ */
+
+#ifdef __DJGPP__
+
+int
+unsetenv (const char *name)
+{
+  if (!name || !*name || strchr (name, '=') != NULL)
+    return -1;
+
+  return putenv (name);
+}
+
+/* This is needed to defeat too-clever GCC warnings in dfa.c about
+   comparison being always false due to limited range of data type.  */
+wint_t
+btowc (int c)
+{
+  return c;
+}
+
+#endif /* __DJGPP__ */
