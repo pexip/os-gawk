@@ -1,10 +1,28 @@
+/* vms_cli.c -- interface to CLI$xxx routines for fetching command line components
+
+   Copyright (C) 1991-1993, 2003, 2011, 2014 the Free Software Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 2, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.  */
+ 
+
 /*
  * vms_cli.c - command line interface routines.
  *							Pat Rankin, Nov'89
  *	Routines called from vms_gawk.c for DCL parsing.
  */
 
-#define  P(foo) ()
 #include "config.h"	/* in case we want to suppress 'const' &c */
 #include "vms.h"
 #ifndef _STRING_H
@@ -14,10 +32,10 @@
 extern U_Long CLI$PRESENT(const Dsc *);
 extern U_Long CLI$GET_VALUE(const Dsc *, Dsc *, short *);
 extern U_Long CLI$DCL_PARSE(const Dsc *, const void *, ...);
-extern U_Long sys$cli(void *, ...);
-extern U_Long sys$filescan(const Dsc *, void *, long *);
-extern void  *lib$establish(U_Long (*handler)(void *, void *));
-extern U_Long lib$sig_to_ret(void *, void *);	/* condition handler */
+extern U_Long SYS$CLI(void *, ...);
+extern U_Long SYS$FILESCAN(const Dsc *, void *, long *);
+extern void  *LIB$ESTABLISH(U_Long (*handler)(void *, void *));
+extern U_Long LIB$SIG_TO_RET(void *, void *);	/* condition handler */
 
 /* Cli_Present() - call CLI$PRESENT to determine whether a parameter or     */
 /*		  qualifier is present on the [already parsed] command line */
@@ -25,7 +43,7 @@ U_Long
 Cli_Present( const char *item )
 {
     Dsc item_dsc;
-    (void)lib$establish(lib$sig_to_ret);
+    (void)LIB$ESTABLISH(LIB$SIG_TO_RET);
 
     item_dsc.len = strlen(item_dsc.adr = (char *)item);
     return CLI$PRESENT(&item_dsc);
@@ -39,7 +57,7 @@ Cli_Get_Value( const char *item, char *result, int size )
     Dsc item_dsc, res_dsc;
     U_Long sts;
     short len = 0;
-    (void)lib$establish(lib$sig_to_ret);
+    (void)LIB$ESTABLISH(LIB$SIG_TO_RET);
 
     item_dsc.len = strlen(item_dsc.adr = (char *)item);
     res_dsc.len = size,  res_dsc.adr = result;
@@ -61,11 +79,11 @@ Cli_Parse_Command( const void *cmd_tables, const char *cmd_verb )
     U_Long sts;
     int    ltmp;
     char   longbuf[8200];
-    (void)lib$establish(lib$sig_to_ret);
+    (void)LIB$ESTABLISH(LIB$SIG_TO_RET);
 
     memset(&cmd, 0, sizeof cmd);
     cmd.rqtype = CLI$K_GETCMD;		/* command line minus the verb */
-    sts = sys$cli(&cmd, (void *)0, (void *)0);	/* get actual command line */
+    sts = SYS$CLI(&cmd, (void *)0, (void *)0);	/* get actual command line */
 
     if (vmswork(sts)) {		/* ok => cli available & verb wasn't "RUN" */
 	/* invoked via symbol => have command line (which might be empty) */
@@ -74,7 +92,7 @@ Cli_Parse_Command( const void *cmd_tables, const char *cmd_verb )
 	    /* need to strip image name from MCR invocation   */
 	    memset(fscn, 0, sizeof fscn);
 	    fscn[0].code = FSCN$_FILESPEC;	/* full file specification */
-	    (void)sys$filescan(&cmd.rdesc, fscn, (long *)0);
+	    (void)SYS$FILESCAN(&cmd.rdesc, fscn, (long *)0);
 	    cmd.rdesc.len -= fscn[0].len;	/* shrink size */
 	    cmd.rdesc.adr += fscn[0].len;	/* advance ptr */
 	}
@@ -84,7 +102,7 @@ Cli_Parse_Command( const void *cmd_tables, const char *cmd_verb )
 	    cmd.rdesc.len = sizeof longbuf - ltmp;
 	strncpy(&longbuf[ltmp], cmd.rdesc.adr, cmd.rdesc.len);
 	cmd.rdesc.len += ltmp,	cmd.rdesc.adr = longbuf;
-	sts = CLI$DCL_PARSE( &cmd.rdesc, cmd_tables);
+	sts = CLI$DCL_PARSE(&cmd.rdesc, cmd_tables);
     }
 
     return sts;

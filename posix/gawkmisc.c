@@ -1,6 +1,7 @@
 /* gawkmisc.c --- miscellaneous gawk routines that are OS specific.
  
-   Copyright (C) 1986, 1988, 1989, 1991 - 1998, 2001 - 2004 the Free Software Foundation, Inc.
+   Copyright (C) 1986, 1988, 1989, 1991 - 1998, 2001 - 2004, 2011
+   the Free Software Foundation, Inc.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -16,8 +17,16 @@
    along with this program; if not, write to the Free Software Foundation,
    Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.  */
 
+#ifdef __CYGWIN__
+#include <stdio.h>
+#include <windows.h>
+#include <sys/cygwin.h>
+#include <io.h>
+#endif
+
 char quote = '\'';
 char *defpath = DEFPATH;
+char *deflibpath = DEFLIBPATH;
 char envsep = ':';
 
 #ifndef INVALID_HANDLE
@@ -28,8 +37,7 @@ char envsep = ':';
 /* gawk_name --- pull out the "gawk" part from how the OS called us */
 
 char *
-gawk_name(filespec)
-const char *filespec;
+gawk_name(const char *filespec)
 {
 	char *p;
     
@@ -41,9 +49,7 @@ const char *filespec;
 /* os_arg_fixup --- fixup the command line */
 
 void
-os_arg_fixup(argcp, argvp)
-int *argcp;
-char ***argvp;
+os_arg_fixup(int *argcp, char ***argvp)
 {
 	/* no-op */
 	return;
@@ -52,9 +58,7 @@ char ***argvp;
 /* os_devopen --- open special per-OS devices */
 
 int
-os_devopen(name, flag)
-const char *name;
-int flag;
+os_devopen(const char *name, int flag)
 {
 	/* no-op */
 	return INVALID_HANDLE;
@@ -85,14 +89,12 @@ int flag;
  */
 
 size_t
-optimal_bufsize(fd, stb)
-int fd;
-struct stat *stb;
+optimal_bufsize(int fd, struct stat *stb)
 {
 	char *val;
 	static size_t env_val = 0;
-	static short first = TRUE;
-	static short exact = FALSE;
+	static bool first = true;
+	static bool exact = false;
 
 	/* force all members to zero in case OS doesn't use all of them. */
 	memset(stb, '\0', sizeof(struct stat));
@@ -102,13 +104,13 @@ struct stat *stb;
 		fatal("can't stat fd %d (%s)", fd, strerror(errno));
 
 	if (first) {
-		first = FALSE;
+		first = false;
 
 		if ((val = getenv("AWKBUFSIZE")) != NULL) {
 			if (strcmp(val, "exact") == 0)
-				exact = TRUE;
-			else if (isdigit(*val)) {
-				for (; *val && isdigit(*val); val++)
+				exact = true;
+			else if (isdigit((unsigned char) *val)) {
+				for (; *val && isdigit((unsigned char) *val); val++)
 					env_val = (env_val * 10) + *val - '0';
 
 				return env_val;
@@ -125,7 +127,7 @@ struct stat *stb;
 	 * guess. We use stdio's BUFSIZ, since that is what it was
 	 * meant for in the first place.
 	 */
-#ifdef HAVE_ST_BLKSIZE
+#ifdef HAVE_STRUCT_STAT_ST_BLKSIZE
 #define DEFBLKSIZE	(stb->st_blksize > 0 ? stb->st_blksize : BUFSIZ)
 #else
 #define DEFBLKSIZE	BUFSIZ
@@ -143,8 +145,7 @@ struct stat *stb;
 /* ispath --- return true if path has directory components */
 
 int
-ispath(file)
-const char *file;
+ispath(const char *file)
 {
 	return (strchr(file, '/') != NULL);
 }
@@ -152,8 +153,7 @@ const char *file;
 /* isdirpunct --- return true if char is a directory separator */
 
 int
-isdirpunct(c)
-int c;
+isdirpunct(int c)
 {
 	return (c == '/');
 }
@@ -161,15 +161,32 @@ int c;
 /* os_close_on_exec --- set close on exec flag, print warning if fails */
 
 void
-os_close_on_exec(fd, name, what, dir)
-int fd;
-const char *name, *what, *dir;
+os_close_on_exec(int fd, const char *name, const char *what, const char *dir)
 {
+	int curflags = 0;
+
 	if (fd <= 2)	/* sanity */
 		return;
 
-	if (fcntl(fd, F_SETFD, 1) < 0)
-		warning(_("%s %s `%s': could not set close-on-exec: (fcntl: %s)"),
+	/*
+	 * Per POSIX, use Read/Modify/Write - get the flags,
+	 * add FD_CLOEXEC, set the flags back.
+	 */
+
+	if ((curflags = fcntl(fd, F_GETFD)) < 0) {
+		warning(_("%s %s `%s': could not get fd flags: (fcntl F_GETFD: %s)"),
+			what, dir, name, strerror(errno));
+		return;
+	}
+
+#ifndef FD_CLOEXEC
+#define FD_CLOEXEC	1
+#endif
+
+	curflags |= FD_CLOEXEC;
+
+	if (fcntl(fd, F_SETFD, curflags) < 0)
+		warning(_("%s %s `%s': could not set close-on-exec: (fcntl F_SETFD: %s)"),
 			what, dir, name, strerror(errno));
 }
 
@@ -180,12 +197,39 @@ const char *name, *what, *dir;
 #endif
 
 int
-os_isdir(fd)
-int fd;
+os_isdir(int fd)
 {
 	struct stat sbuf;
 
 	return (fstat(fd, &sbuf) == 0 && S_ISDIR(sbuf.st_mode));
+}
+
+/* os_isreadable --- fd can be read from */
+
+int
+os_isreadable(const awk_input_buf_t *iobuf, bool *isdir)
+{
+	*isdir = false;
+
+	if (iobuf->fd == INVALID_HANDLE)
+		return false;
+
+	switch (iobuf->sbuf.st_mode & S_IFMT) {
+	case S_IFREG:
+	case S_IFCHR:	/* ttys, /dev/null, .. */
+#ifdef S_IFSOCK
+	case S_IFSOCK:
+#endif
+#ifdef S_IFIFO
+	case S_IFIFO:
+#endif
+		return true;
+	case S_IFDIR:
+		*isdir = true;
+		/* fall through */
+	default:
+		return false;
+	}
 }
 
 /* os_is_setuid --- true if running setuid root */
@@ -204,8 +248,7 @@ os_is_setuid()
 /* os_setbinmode --- set binary mode on file */
 
 int
-os_setbinmode(fd, mode)
-int fd, mode;
+os_setbinmode(int fd, int mode)
 {
 #ifdef __CYGWIN__
 	setmode (fd, mode);
@@ -216,33 +259,52 @@ int fd, mode;
 /* os_restore_mode --- restore the original mode of the console device */
 
 void
-os_restore_mode (fd)
-int fd;
+os_restore_mode(int fd)
 {
 	/* no-op */
 	return;
 }
 
-#ifdef __CYGWIN__
-#include <stdio.h>
-#include <sys/cygwin.h>
+/* os_isatty --- return true if fd is a tty */
 
-extern int _fmode;
-void
-cygwin_premain0 (int argc, char **argv, void *myself)
+int
+os_isatty(int fd)
 {
-  static struct __cygwin_perfile pf[] =
-  {
-    {"", O_RDONLY | O_TEXT},
-    /*{"", O_WRONLY | O_BINARY},*/
-    {NULL, 0}
-  };
-  cygwin_internal (CW_PERFILE, pf);
+	return isatty(fd);
+}
+ 
+/* files_are_same --- return true if files are identical */
+
+int
+files_are_same(char *path, SRCFILE *src)
+{
+	struct stat st;
+
+	return (stat(path, & st) == 0
+		&& st.st_dev == src->sbuf.st_dev
+		&& st.st_ino == src->sbuf.st_ino);
 }
 
 void
-cygwin_premain2 (int argc, char **argv, void *myself)
+init_sockets(void)
 {
-  setmode (fileno (stdin), O_TEXT);
+}
+
+#ifdef __CYGWIN__
+void
+cygwin_premain0(int argc, char **argv, struct per_process *myself)
+{
+	static struct __cygwin_perfile pf[] = {
+		{ "", O_RDONLY | O_TEXT },
+		/*{ "", O_WRONLY | O_BINARY },*/
+		{ NULL, 0 }
+	};
+	cygwin_internal(CW_PERFILE, pf);
+}
+
+void
+cygwin_premain2(int argc, char **argv, struct per_process *myself)
+{
+	setmode(fileno (stdin), O_TEXT);
 }
 #endif

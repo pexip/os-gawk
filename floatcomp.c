@@ -3,7 +3,7 @@
  */
 
 /* 
- * Copyright (C) 1986, 1988, 1989, 1991-2010 the Free Software Foundation, Inc.
+ * Copyright (C) 1986, 1988, 1989, 1991-2011 the Free Software Foundation, Inc.
  * 
  * This file is part of GAWK, the GNU implementation of the
  * AWK Programming Language.
@@ -25,6 +25,8 @@
 
 #include "awk.h"
 #include <math.h>
+
+#ifdef HAVE_UINTMAX_T
 
 /* Assume IEEE-754 arithmetic on pre-C89 hosts.  */
 #ifndef FLT_RADIX
@@ -69,40 +71,6 @@ Please port the following code to your weird host;
 #define AWKNUM_FRACTION_BITS (AWKNUM_MANT_DIG * (FLT_RADIX == 2 ? 1 : 4))
 #define DBL_FRACTION_BITS (DBL_MANT_DIG * (FLT_RADIX == 2 ? 1 : 4))
 
-/*
- * Floor and Ceil --- Work around a problem in conversion of
- * doubles to exact integers.
- */
-
-/* Floor --- do floor(), also for Cray */
-
-AWKNUM
-Floor(AWKNUM n)
-{
-	return floor(n
-#if 0
-#ifdef _CRAY
-		* (1.0 + DBL_EPSILON)
-#endif
-#endif
-	);
-}
-
-/* Ceil --- do ceil(), also for Cray */
-
-AWKNUM
-Ceil(AWKNUM n)
-{
-	return ceil(n
-#if 0
-#ifdef _CRAY
-		* (1.0 + DBL_EPSILON)
-#endif
-#endif
-	);
-}
-
-#ifdef HAVE_UINTMAX_T
 /* adjust_uint --- fiddle with values, ask Paul Eggert to explain */
 
 uintmax_t

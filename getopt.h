@@ -1,6 +1,5 @@
 /* Declarations for getopt.
-   Copyright (C) 1989-1994,1996-1999,2001,2003,2004
-   Free Software Foundation, Inc.
+   Copyright (C) 1989-2014 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -14,9 +13,8 @@
    Lesser General Public License for more details.
 
    You should have received a copy of the GNU Lesser General Public
-   License along with the GNU C Library; if not, write to the Free
-   Software Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-   02110-1301 USA.  */
+   License along with the GNU C Library; if not, see
+   <http://www.gnu.org/licenses/>.  */
 
 #ifndef _GETOPT_H
 
@@ -158,9 +156,9 @@ extern int getopt (int ___argc, char *const *___argv, const char *__shortopts)
    additional functionality can be disable at runtime.  This redirection
    helps to also do this at runtime.  */
 #  ifdef __REDIRECT
-  extern int __REDIRECT (getopt, (int ___argc, char *const *___argv,
-				  const char *__shortopts),
-			 __posix_getopt) __THROW;
+  extern int __REDIRECT_NTH (getopt, (int ___argc, char *const *___argv,
+				      const char *__shortopts),
+			     __posix_getopt);
 #  else
 extern int __posix_getopt (int ___argc, char *const *___argv,
 			   const char *__shortopts) __THROW;

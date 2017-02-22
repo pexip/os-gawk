@@ -1,9 +1,10 @@
 # alarm.awk --- set an alarm
 #
-# Requires gettimeofday library function
+# Requires getlocaltime() library function
 #
 # Arnold Robbins, arnold@skeeve.com, Public Domain
 # May 1993
+# Revised December 2010
 
 # usage: alarm time [ "message" [ count [ delay ] ] ]
 
@@ -17,19 +18,24 @@ BEGIN    \
         print usage1 > "/dev/stderr"
         print usage2 > "/dev/stderr"
         exit 1
-    } else if (ARGC == 5) {
+    }
+    switch (ARGC) {
+    case 5:
         delay = ARGV[4] + 0
+        # fall through
+    case 4:
         count = ARGV[3] + 0
+        # fall through
+    case 3:
         message = ARGV[2]
-    } else if (ARGC == 4) {
-        count = ARGV[3] + 0
-        message = ARGV[2]
-    } else if (ARGC == 3) {
-        message = ARGV[2]
-    } else if (ARGV[1] !~ /[0-9]?[0-9]:[0-9][0-9]/) {
-        print usage1 > "/dev/stderr"
-        print usage2 > "/dev/stderr"
-        exit 1
+        break
+    default:
+        if (ARGV[1] !~ /[[:digit:]]?[[:digit:]]:[[:digit:]]{2}/) {
+            print usage1 > "/dev/stderr"
+            print usage2 > "/dev/stderr"
+            exit 1
+        }
+        break
     }
 
     # set defaults for once we reach the desired time
@@ -47,7 +53,7 @@ BEGIN    \
     minute = atime[2] + 0  # force numeric
 
     # get current broken down time
-    gettimeofday(now)
+    getlocaltime(now)
 
     # if time given is 12-hour hours and it's after that
     # hour, e.g., `alarm 5:30' at 9 a.m. means 5:30 p.m.,
