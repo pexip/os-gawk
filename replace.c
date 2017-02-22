@@ -3,7 +3,7 @@
  */
 
 /* 
- * Copyright (C) 1989, 1991-2010 the Free Software Foundation, Inc.
+ * Copyright (C) 1989, 1991-2013 the Free Software Foundation, Inc.
  * 
  * This file is part of GAWK, the GNU implementation of the
  * AWK Programming Language.
@@ -27,25 +27,11 @@
  * Do all necessary includes here, so that we don't have to worry about
  * overlapping includes in the files in missing.d.
  */
-#include "config.h"
-#include "awk.h"
+#include "awk.h"	/* includes config.h for us */
 
-
-#ifdef atarist
-/*
- * this will work with gcc compiler - for other compilers you may
- * have to replace path separators in this file into backslashes
- */
-#include "unsupported/atari/stack.c"
-#include "unsupported/atari/tmpnam.c"
-#endif /* atarist */
 
 #ifndef HAVE_SYSTEM
-#ifdef atarist
-#include "unsupported/atari/system.c"
-#else
 #include "missing_d/system.c"
-#endif
 #endif /* HAVE_SYSTEM */
 
 #ifndef HAVE_MEMCMP
@@ -73,7 +59,14 @@
 #endif	/* HAVE_STRERROR */
 
 #ifndef HAVE_STRFTIME
+# ifdef __MINGW32__
+/* Need to use underlying_strftime in replacement strftime.  */
+#  define HAVE_STRFTIME 1
+# endif
 #include "missing_d/strftime.c"
+# ifdef __MINGW32__
+#  undef HAVE_STRFTIME
+# endif
 #endif	/* HAVE_STRFTIME */
 
 #ifndef HAVE_STRCHR
@@ -91,13 +84,7 @@
 #ifndef HAVE_TZSET
 #include "missing_d/tzset.c"
 #endif /* HAVE_TZSET */
-
-#if defined TANDEM
-#include "strdupc"
-#include "getidc"
-#include "strnchkc"
-#endif /* TANDEM */
-
+ 
 #ifndef HAVE_MKTIME
 /* mktime.c defines main() if DEBUG is set */
 #undef DEBUG
@@ -114,4 +101,16 @@
 
 #ifndef HAVE_USLEEP
 #include "missing_d/usleep.c"
+#endif
+
+#ifndef HAVE_SETENV
+#include "missing_d/setenv.c"
+#endif
+
+#ifndef HAVE_STRCOLL
+#include "missing_d/strcoll.c"
+#endif
+
+#if ! MBS_SUPPORT
+#include "missing_d/wcmisc.c"
 #endif

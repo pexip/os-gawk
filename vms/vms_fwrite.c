@@ -1,6 +1,6 @@
 /* vms_fwrite.c - augmentation for the fwrite() function.
 
-   Copyright (C) 1991-1996 the Free Software Foundation, Inc.
+   Copyright (C) 1991-1996, 2010, 2011, 2014 the Free Software Foundation, Inc.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -50,6 +50,9 @@ static int    prev_file_num;
      * unless fflush() is always called first.	Also, this routine
      * will not detect that a freopen() call has finished with the
      * original terminal; tty_fclose() should be used to close a file.
+     *
+     * When running gawk's debugging version we stick with normal
+     * fwrite because dgawk also uses other stdio calls for output.
      */
 #ifdef fwrite
 # undef fwrite
@@ -73,26 +76,31 @@ tty_fwrite( const void *buf, size_t size, size_t number, FILE *file )
 
     chan = file_num < _NFILE ? channel[file_num] : -1;
     if (chan == 0) {	/* if not initialized, need to assign a channel */
-	if (isatty(file_num) > 0) {	/* isatty: 1=yes, 0=no, -1=problem */
+	if (isatty(file_num) > 0	/* isatty: 1=yes, 0=no, -1=problem */
+	    && ! do_debug) {
 	    Dsc  device;
 	    char devnam[255+1];
+
 	    fgetname(file, devnam);			/* get 'file's name */
 	    device.len = strlen(device.adr = devnam);	/* create descriptor */
-	    if (vmswork(sys$assign(&device, &chan, 0, (Dsc *)0))) {
+	    if (vmswork(SYS$ASSIGN(&device, &chan, 0, (Dsc *)0))) {
 		/* get an event flag; use #0 if problem */
-		if (evfn == -1 && vmsfail(lib$get_ef(&evfn)))  evfn = 0;
+		if (evfn == -1 && vmsfail(LIB$GET_EF(&evfn)))  evfn = 0;
 	    } else  chan = 0;	    /* $ASSIGN failed */
 	}
 	/* store channel for later use; -1 => don't repeat failed init attempt */
 	channel[file_num] = (chan > 0 ? chan : -1);
     }
-    if (chan > 0) {		/* chan > 0 iff 'file' is a terminal */
+
+    /* chan > 0 iff 'file' is a terminal and we're not running as dgawk */
+    if (chan > 0) {
 	struct _iosbw { U_Short status, count; U_Long rt_kludge; } iosb;
 	register U_Long sts = 1;
 	register char  *pt = (char *)buf;
 	register int	offset, pos, count = size * number;
 	U_Long cc_fmt, io_func = IO$_WRITEVBLK;
 	int    extra = 0;
+
 	result = 0;
 	if (is_stderr(file_num))	/* if it's SYS$ERROR (stderr)... */
 	    io_func |= IO$M_CANCTRLO;	/* cancel ^O (resume tty output) */
@@ -111,19 +119,19 @@ tty_fwrite( const void *buf, size_t size, size_t number, FILE *file )
 	    else if (pos < count)  pos++,  cc_fmt |= POSTFIX_CR,  extra++;
 	    /* wait for previous write, if any, to complete */
 	    if (pt > (char *)buf) {
-		sts = sys$synch(evfn, &iosb);
+		sts = SYS$SYNCH(evfn, &iosb);
 		if (vmswork(sts))  sts = iosb.status,  result += iosb.count;
 		if (vmsfail(sts))  break;
 	    }
 	    /* queue an asynchronous write */
-	    sts = sys$qio(evfn, chan, io_func, &iosb, (void (*)(U_Long))0, 0L,
+	    sts = SYS$QIO(evfn, chan, io_func, &iosb, (void (*)(U_Long))0, 0L,
 			  pt, pos, 0, cc_fmt, 0, 0);
 	    if (vmsfail(sts))  break;	/*(should never happen)*/
 	    pt += pos,	count -= pos;
 	}
 	/* wait for last write to complete */
 	if (pt > (char *)buf && vmswork(sts)) {
-	    sts = sys$synch(evfn, &iosb);
+	    sts = SYS$SYNCH(evfn, &iosb);
 	    if (vmswork(sts))  sts = iosb.status,  result += iosb.count;
 	}
 	if (vmsfail(sts))  errno = EVMSERR,  vaxc$errno = sts;
@@ -160,6 +168,7 @@ tty_fwrite( const void *buf, size_t size, size_t number, FILE *file )
 #endif /*NO_ALLOCA*/
 	    register char *pt = (char *)buf;
 	    register int   pos,  count = number;
+
 	    if (pt[count] != '\0') {	/*(out of bounds, but relatively safe)*/
 		pt = (char *)alloca(count + 1);
 		memcpy(pt, buf, count),  pt[count] = '\0';
@@ -191,8 +200,9 @@ tty_fclose( FILE *file )
     if (file && *file) {  /* note: VAXCRTL stdio has extra level of indirection */
 	int   file_num = fileno(file);
 	short chan = file_num < _NFILE ? channel[file_num] : -1;
+
 	if (chan > 0)
-	    (void)sys$dassgn(chan); /* deassign the channel (ie, close) */
+	    (void)SYS$DASSGN(chan); /* deassign the channel (ie, close) */
 	if (file_num < _NFILE)
 	    channel[file_num] = 0;  /* clear stale info */
     }

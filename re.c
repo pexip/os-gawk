@@ -3,7 +3,7 @@
  */
 
 /* 
- * Copyright (C) 1991-2010 the Free Software Foundation, Inc.
+ * Copyright (C) 1991-2013 the Free Software Foundation, Inc.
  * 
  * This file is part of GAWK, the GNU implementation of the
  * AWK Programming Language.
@@ -26,27 +26,35 @@
 #include "awk.h"
 
 static reg_syntax_t syn;
+static void check_bracket_exp(char *s, size_t len);
+const char *regexflags2str(int flags);
 
 /* make_regexp --- generate compiled regular expressions */
 
 Regexp *
-make_regexp(const char *s, size_t len, int ignorecase, int dfa)
+make_regexp(const char *s, size_t len, bool ignorecase, bool dfa, bool canfatal)
 {
+	static char metas[] = ".*+(){}[]|?^$\\";
 	Regexp *rp;
 	const char *rerr;
 	const char *src = s;
-	char *temp;
+	static char *buf = NULL;
+	static size_t buflen;
 	const char *end = s + len;
-	register char *dest;
-	register int c, c2;
-	static short first = TRUE;
-	static short no_dfa = FALSE;
-	int has_anchor = FALSE;
+	char *dest;
+	int c, c2;
+	static bool first = true;
+	static bool no_dfa = false;
+	bool has_anchor = false;
+	reg_syntax_t dfa_syn;
+	int i;
 
-	/* The number of bytes in the current multibyte character.
-	   It is 0, when the current character is a singlebyte character.  */
+	/*
+	 * The number of bytes in the current multibyte character.
+	 * It is 0, when the current character is a singlebyte character.
+	 */
 	size_t is_multibyte = 0;
-#ifdef MBS_SUPPORT
+#if MBS_SUPPORT
 	mbstate_t mbs;
 
 	if (gawk_mb_cur_max > 1)
@@ -54,29 +62,41 @@ make_regexp(const char *s, size_t len, int ignorecase, int dfa)
 #endif
 
 	if (first) {
-		first = FALSE;
-		no_dfa = (getenv("GAWK_NO_DFA") != NULL);	/* for debugging and testing */
+		first = false;
+		/* for debugging and testing */
+		no_dfa = (getenv("GAWK_NO_DFA") != NULL);
 	}
+
+	/* always check */
+	check_bracket_exp((char *) s, len);
 
 	/* Handle escaped characters first. */
 
 	/*
-	 * Build a copy of the string (in dest) with the
+	 * Build a copy of the string (in buf) with the
 	 * escaped characters translated, and generate the regex
-	 * from that.  
+	 * from that. 
 	 */
-	emalloc(dest, char *, len + 2, "make_regexp");
-	temp = dest;
+	if (buf == NULL) {
+		emalloc(buf, char *, len + 2, "make_regexp");
+		buflen = len;
+	} else if (len > buflen) {
+		erealloc(buf, char *, len + 2, "make_regexp");
+		buflen = len;
+	}
+	dest = buf;
 
 	while (src < end) {
-#ifdef MBS_SUPPORT
+#if MBS_SUPPORT
 		if (gawk_mb_cur_max > 1 && ! is_multibyte) {
 			/* The previous byte is a singlebyte character, or last byte
 			   of a multibyte character.  We check the next character.  */
 			is_multibyte = mbrlen(src, end - src, &mbs);
-			if ((is_multibyte == 1) || (is_multibyte == (size_t) -1)
-				|| (is_multibyte == (size_t) -2 || (is_multibyte == 0))) {
-				/* We treat it as a singlebyte character.  */
+			if (   is_multibyte == 1
+			    || is_multibyte == (size_t) -1
+			    || is_multibyte == (size_t) -2
+			    || is_multibyte == 0) {
+				/* We treat it as a single-byte character.  */
 				is_multibyte = 0;
 			}
 		}
@@ -112,7 +132,9 @@ make_regexp(const char *s, size_t len, int ignorecase, int dfa)
 				 * literally in re's, so escape regexp
 				 * metacharacters.
 				 */
-				if (do_traditional && ! do_posix && (isdigit(c) || c == 'x')
+				if (do_traditional
+				    && ! do_posix
+				    && (isdigit(c) || c == 'x')
 				    && strchr("()|*+?.^$\\[]", c2) != NULL)
 					*dest++ = '\\';
 				*dest++ = (char) c2;
@@ -140,17 +162,20 @@ make_regexp(const char *s, size_t len, int ignorecase, int dfa)
 		} else {
 			c = *src;
 			if (c == '^' || c == '$')
-				has_anchor = TRUE;
+				has_anchor = true;
+
 			*dest++ = *src++;	/* not '\\' */
 		}
 		if (gawk_mb_cur_max > 1 && is_multibyte)
 			is_multibyte--;
 	} /* while */
 
-	*dest = '\0' ;	/* Only necessary if we print dest ? */
+	*dest = '\0';
+	len = dest - buf;
+
 	emalloc(rp, Regexp *, sizeof(*rp), "make_regexp");
 	memset((char *) rp, 0, sizeof(*rp));
-	rp->dfareg = dfaalloc();
+	rp->dfareg = NULL;
 	rp->pat.allocated = 0;	/* regex will allocate the buffer */
 	emalloc(rp->pat.fastmap, char *, 256, "make_regexp");
 
@@ -169,6 +194,7 @@ make_regexp(const char *s, size_t len, int ignorecase, int dfa)
 	 * discussion by the definition of casetable[] in eval.c.
 	 */
 
+	ignorecase = !! ignorecase;	/* force to 1 or 0 */
 	if (ignorecase) {
 		if (gawk_mb_cur_max > 1) {
 			syn |= RE_ICASE;
@@ -182,34 +208,58 @@ make_regexp(const char *s, size_t len, int ignorecase, int dfa)
 		syn &= ~RE_ICASE;
 	}
 
-	dfasyntax(syn | (ignorecase ? RE_ICASE : 0), ignorecase ? TRUE : FALSE, '\n');
+	dfa_syn = syn;
+	if (ignorecase)
+		dfa_syn |= RE_ICASE;
+	dfasyntax(dfa_syn, ignorecase, '\n');
 	re_set_syntax(syn);
 
-	len = dest - temp;
-	if ((rerr = re_compile_pattern(temp, len, &(rp->pat))) != NULL)
-		fatal("%s: /%s/", rerr, temp);	/* rerr already gettextized inside regex routines */
+	if ((rerr = re_compile_pattern(buf, len, &(rp->pat))) != NULL) {
+		refree(rp);
+		if (! canfatal) {
+			/* rerr already gettextized inside regex routines */
+			error("%s: /%s/", rerr, buf);
+ 			return NULL;
+		}
+		fatal("%s: /%s/", rerr, buf);
+	}
 
 	/* gack. this must be done *after* re_compile_pattern */
-	rp->pat.newline_anchor = FALSE; /* don't get \n in middle of string */
+	rp->pat.newline_anchor = false; /* don't get \n in middle of string */
 	if (dfa && ! no_dfa) {
-		dfacomp(temp, len, rp->dfareg, TRUE);
-		rp->dfa = TRUE;
+		rp->dfa = true;
+		rp->dfareg = dfaalloc();
+		dfacomp(buf, len, rp->dfareg, true);
 	} else
-		rp->dfa = FALSE;
+		rp->dfa = false;
 	rp->has_anchor = has_anchor;
 
-	free(temp);
+	/* Additional flags that help with RS as regexp. */
+	for (i = 0; i < len; i++) {
+		if (strchr(metas, buf[i]) != NULL) {
+			rp->has_meta = true;
+			break;
+		}
+	}
+
+	for (i = len - 1; i >= 0; i--) {
+		if (strchr("*+|?", buf[i]) != NULL) {
+			rp->maybe_long = true;
+			break;
+		}
+	}
+ 
 	return rp;
 }
 
 /* research --- do a regexp search. use dfa if possible */
 
 int
-research(Regexp *rp, register char *str, int start,
-	register size_t len, int flags)
+research(Regexp *rp, char *str, int start,
+	 size_t len, int flags)
 {
 	const char *ret = str;
-	int try_backref;
+	int try_backref = false;
 	int need_start;
 	int no_bol;
 	int res;
@@ -227,31 +277,25 @@ research(Regexp *rp, register char *str, int start,
 	 * The dfa matcher doesn't have a no_bol flag, so don't bother
 	 * trying it in that case.
 	 *
-	 * 4/2007: Grrrr.  The dfa matcher has bugs in certain multibyte
-	 * cases that are just too deeply buried to ferret out. Don't
-	 * let this kill us if we need_start.  (This may be too narrowly
-	 * focused, perhaps we should relegate the DFA matcher to the
-	 * single byte case all the time. OTOH, the speed difference
-	 * between the matchers in non-trivial... Sigh.)
-	 *
-	 * 7/2008: Simplify: skip dfa matcher if need_start. The above
-	 * problems are too much to deal with.
+	 * 7/2008: Skip the dfa matcher if need_start. The dfa matcher
+	 * has bugs in certain multibyte cases and it's too difficult
+	 * to try to special case things.
 	 */
 	if (rp->dfa && ! no_bol && ! need_start) {
 		char save;
-		int count = 0;
- 		/*
+		size_t count = 0;
+		/*
 		 * dfa likes to stick a '\n' right after the matched
 		 * text.  So we just save and restore the character.
 		 */
 		save = str[start+len];
-		ret = dfaexec(rp->dfareg, str+start, str+start+len, TRUE,
+		ret = dfaexec(rp->dfareg, str+start, str+start+len, true,
 					&count, &try_backref);
 		str[start+len] = save;
 	}
 
 	if (ret) {
-		if (need_start || rp->dfa == FALSE || try_backref) {
+		if (need_start || rp->dfa == false || try_backref) {
 			/*
 			 * Passing NULL as last arg speeds up search for cases
 			 * where we don't need the start/end info.
@@ -272,14 +316,9 @@ research(Regexp *rp, register char *str, int start,
 void
 refree(Regexp *rp)
 {
-	/*
-	 * This isn't malloced, don't let regfree free it.
-	 * (This is strictly necessary only for the old
-	 * version of regex, but it's a good idea to keep it
-	 * here in case regex internals change in the future.)
-	 */
+	if (rp == NULL)
+		return; 
 	rp->pat.translate = NULL;
-
 	regfree(& rp->pat);
 	if (rp->regs.start)
 		free(rp->regs.start);
@@ -289,15 +328,16 @@ refree(Regexp *rp)
 		dfafree(rp->dfareg);
 		free(rp->dfareg);
 	}
-	free(rp);
+	efree(rp);
 }
- 
+
 /* dfaerror --- print an error message for the dfa routines */
 
 void
 dfaerror(const char *s)
 {
 	fatal("%s", s);
+	exit(EXIT_FATAL);	/* for DJGPP */
 }
 
 /* re_update --- recompile a dynamic regexp */
@@ -308,21 +348,26 @@ re_update(NODE *t)
 	NODE *t1;
 
 	if ((t->re_flags & CASE) == IGNORECASE) {
+		/* regex was compiled with settings matching IGNORECASE */
 		if ((t->re_flags & CONSTANT) != 0) {
+			/* it's a constant, so just return it as is */
 			assert(t->type == Node_regex);
 			return t->re_reg;
 		}
-		t1 = force_string(tree_eval(t->re_exp));
+		t1 = t->re_exp;
 		if (t->re_text != NULL) {
-			if (cmp_nodes(t->re_text, t1) == 0) {
-				free_temp(t1);
+			/* if contents haven't changed, just return it */
+			if (cmp_nodes(t->re_text, t1) == 0)
 				return t->re_reg;
-			}
+			/* things changed, fall through to recompile */
 			unref(t->re_text);
 		}
+		/* get fresh copy of the text of the regexp */
 		t->re_text = dupnode(t1);
-		free_temp(t1);
 	}
+	/* was compiled with different IGNORECASE or text changed */
+
+	/* free old */
 	if (t->re_reg != NULL)
 		refree(t->re_reg);
 	if (t->re_cnt > 0)
@@ -330,14 +375,18 @@ re_update(NODE *t)
 	if (t->re_cnt > 10)
 		t->re_cnt = 0;
 	if (t->re_text == NULL || (t->re_flags & CASE) != IGNORECASE) {
-		t1 = force_string(tree_eval(t->re_exp));
+		/* reset regexp text if needed */
+		t1 = t->re_exp;
 		unref(t->re_text);
 		t->re_text = dupnode(t1);
-		free_temp(t1);
 	}
+	/* compile it */
 	t->re_reg = make_regexp(t->re_text->stptr, t->re_text->stlen,
-				IGNORECASE, t->re_cnt);
+				IGNORECASE, t->re_cnt, true);
+
+	/* clear case flag */
 	t->re_flags &= ~CASE;
+	/* set current value of case flag */
 	t->re_flags |= IGNORECASE;
 	return t->re_reg;
 }
@@ -347,6 +396,13 @@ re_update(NODE *t)
 void
 resetup()
 {
+	/*
+	 * Syntax bits: _that_ is yet another mind trip.  Recreational drugs
+	 * are helpful for recovering from the experience.
+	 *
+	 *	Aharon Robbins <arnold@skeeve.com>
+	 *	Sun, 21 Oct 2007 23:55:33 +0200
+	 */
 	if (do_posix)
 		syn = RE_SYNTAX_POSIX_AWK;	/* strict POSIX re's */
 	else if (do_traditional)
@@ -355,17 +411,18 @@ resetup()
 		syn = RE_SYNTAX_GNU_AWK;	/* POSIX re's + GNU ops */
 
 	/*
-	 * Interval expressions are off by default, since it's likely to
-	 * break too many old programs to have them on.
+	 * Interval expressions are now on by default, as POSIX is
+	 * wide-spread enough that people want it. The do_intervals
+	 * variable remains for use with --traditional.
 	 */
 	if (do_intervals)
-		syn |= RE_INTERVALS;
+		syn |= RE_INTERVALS | RE_INVALID_INTERVAL_ORD | RE_NO_BK_BRACES;
 
 	(void) re_set_syntax(syn);
-	dfasyntax(syn, FALSE, '\n');
+	dfasyntax(syn, false, '\n');
 }
 
-/* avoid_dfa --- FIXME: temporary kludge function until we have a new dfa.c */
+/* avoid_dfa --- return true if we should not use the DFA matcher */
 
 int
 avoid_dfa(NODE *re, char *str, size_t len)
@@ -373,31 +430,26 @@ avoid_dfa(NODE *re, char *str, size_t len)
 	char *end;
 
 	if (! re->re_reg->has_anchor)
-		return FALSE;
+		return false;
 
 	for (end = str + len; str < end; str++)
 		if (*str == '\n')
-			return TRUE;
+			return true;
 
-	return FALSE;
+	return false;
 }
 
-/* reisstring --- return TRUE if the RE match is a simple string match */
+/* reisstring --- return true if the RE match is a simple string match */
 
 int
 reisstring(const char *text, size_t len, Regexp *re, const char *buf)
 {
-	static char metas[] = ".*+(){}[]|?^$\\";
-	int i;
 	int res;
 	const char *matched;
 
-	/* simple checking for has meta characters in re */
-	for (i = 0; i < len; i++) {
-		if (strchr(metas, text[i]) != NULL) {
-			return FALSE;	/* give up early, can't be string match */
-		}
-	}
+	/* simple checking for meta characters in re */
+	if (re->has_meta)
+		return false;	/* give up early, can't be string match */
 
 	/* make accessable to gdb */
 	matched = &buf[RESTART(re, buf)];
@@ -405,20 +457,6 @@ reisstring(const char *text, size_t len, Regexp *re, const char *buf)
 	res = (memcmp(text, matched, len) == 0);
 
 	return res;
-}
-
-/* remaybelong --- return TRUE if the RE contains * ? | + */
-
-int
-remaybelong(const char *text, size_t len)
-{
-	while (len--) {
-		if (strchr("*+|?", *text++) != NULL) {
-			return TRUE;
-		}
-	}
-
-	return FALSE;
 }
 
 /* reflags2str --- make a regex flags value readable */
@@ -447,7 +485,6 @@ reflags2str(int flagval)
 		{ RE_UNMATCHED_RIGHT_PAREN_ORD, "RE_UNMATCHED_RIGHT_PAREN_ORD" },
 		{ RE_NO_POSIX_BACKTRACKING, "RE_NO_POSIX_BACKTRACKING" },
 		{ RE_NO_GNU_OPS, "RE_NO_GNU_OPS" },
-		{ RE_DEBUG, "RE_DEBUG" },
 		{ RE_INVALID_INTERVAL_ORD, "RE_INVALID_INTERVAL_ORD" },
 		{ RE_ICASE, "RE_ICASE" },
 		{ RE_CARET_ANCHORS_HERE, "RE_CARET_ANCHORS_HERE" },
@@ -460,4 +497,159 @@ reflags2str(int flagval)
 		return "RE_SYNTAX_EMACS";
 
 	return genflags2str(flagval, values);
+}
+
+/*
+ * dfawarn() is called by the dfa routines whenever a regex is compiled
+ * must supply a dfawarn.
+ */
+
+void
+dfawarn(const char *dfa_warning)
+{
+	/*
+	 * This routine does nothing, since gawk does its own
+	 * (better) check for bad [[:foo:]] syntax.
+	 */
+}
+
+/* check_bracket_exp --- look for /[:space:]/ that should be /[[:space:]]/ */
+
+static void
+check_bracket_exp(char *s, size_t length)
+{
+	static struct reclass {
+		const char *name;
+		size_t len;
+		bool warned;
+	} classes[] = {
+		/*
+		 * Ordered by what we hope is frequency,
+		 * since it's linear searched.
+		 */
+		{ "[:alpha:]", 9, false },
+		{ "[:digit:]", 9, false },
+		{ "[:alnum:]", 9, false },
+		{ "[:upper:]", 9, false },
+		{ "[:lower:]", 9, false },
+		{ "[:space:]", 9, false },
+		{ "[:xdigit:]", 10, false },
+		{ "[:punct:]", 9, false },
+		{ "[:print:]", 9, false },
+		{ "[:graph:]", 9, false },
+		{ "[:cntrl:]", 9, false },
+		{ "[:blank:]", 9, false },
+		{ NULL, 0 }
+	};
+	int i;
+	bool found = false;
+	char save;
+	char *sp, *sp2, *end;
+	int len;
+	int count = 0;
+
+	if (length == 0)
+		return;
+
+	end = s + length;
+	save = s[length];
+	s[length] = '\0';
+	sp = s;
+
+again:
+	sp = sp2 = memchr(sp, '[', (end - sp));
+	if (sp == NULL)
+		goto done;
+
+	for (count++, sp++; *sp != '\0'; sp++) {
+		if (*sp == '[')
+			count++;
+		/*
+		 * ] as first char after open [ is skipped
+		 * \] is skipped
+		 * [^]] is skipped
+		 */
+		if (*sp == ']' && sp > sp2) {
+			 if (sp[-1] != '['
+			     && sp[-1] != '\\')
+				 ;
+			 else if ((sp - sp2) >= 2
+				  && sp[-1] == '^' && sp[-2] == '[')
+				 ;
+			 else
+				count--;
+		}
+
+		if (count == 0) {
+			sp++;	/* skip past ']' */
+			break;
+		}
+	}
+
+	if (count > 0) {	/* bad regex, give up */
+		goto done;
+	}
+
+	/* sp2 has start */
+
+	for (i = 0; classes[i].name != NULL; i++) {
+		if (classes[i].warned)
+			continue;
+		len = classes[i].len;
+		if (   len == (sp - sp2)
+		    && memcmp(sp2, classes[i].name, len) == 0) {
+			found = true;
+			break;
+		}
+	}
+
+	if (found && ! classes[i].warned) {
+		warning(_("regexp component `%.*s' should probably be `[%.*s]'"),
+				len, sp2, len, sp2);
+		classes[i].warned = true;
+	}
+
+	if (sp < end) {
+		found = false;
+		goto again;
+	}
+done:
+	s[length] = save;
+}
+
+/* regexflags2str --- make regex flags printable */
+
+const char *
+regexflags2str(int flags)
+{
+	static const struct flagtab regextab[] = {
+		{ RE_BACKSLASH_ESCAPE_IN_LISTS,	"RE_BACKSLASH_ESCAPE_IN_LISTS" },
+		{ RE_BK_PLUS_QM,		"RE_BK_PLUS_QM" },
+		{ RE_CHAR_CLASSES,		"RE_CHAR_CLASSES" },
+		{ RE_CONTEXT_INDEP_ANCHORS,	"RE_CONTEXT_INDEP_ANCHORS" },
+		{ RE_CONTEXT_INDEP_OPS,		"RE_CONTEXT_INDEP_OPS" },
+		{ RE_CONTEXT_INVALID_OPS,	"RE_CONTEXT_INVALID_OPS" },
+		{ RE_DOT_NEWLINE,		"RE_DOT_NEWLINE" },
+		{ RE_DOT_NOT_NULL,		"RE_DOT_NOT_NULL" },
+		{ RE_HAT_LISTS_NOT_NEWLINE,	"RE_HAT_LISTS_NOT_NEWLINE" },
+		{ RE_INTERVALS,			"RE_INTERVALS" },
+		{ RE_LIMITED_OPS,		"RE_LIMITED_OPS" },
+		{ RE_NEWLINE_ALT,		"RE_NEWLINE_ALT" },
+		{ RE_NO_BK_BRACES,		"RE_NO_BK_BRACES" },
+		{ RE_NO_BK_PARENS,		"RE_NO_BK_PARENS" },
+		{ RE_NO_BK_REFS,		"RE_NO_BK_REFS" },
+		{ RE_NO_BK_VBAR,		"RE_NO_BK_VBAR" },
+		{ RE_NO_EMPTY_RANGES,		"RE_NO_EMPTY_RANGES" },
+		{ RE_UNMATCHED_RIGHT_PAREN_ORD,	"RE_UNMATCHED_RIGHT_PAREN_ORD" },
+		{ RE_NO_POSIX_BACKTRACKING,	"RE_NO_POSIX_BACKTRACKING" },
+		{ RE_NO_GNU_OPS,		"RE_NO_GNU_OPS" },
+		{ RE_DEBUG,			"RE_DEBUG" },
+		{ RE_INVALID_INTERVAL_ORD,	"RE_INVALID_INTERVAL_ORD" },
+		{ RE_ICASE,			"RE_ICASE" },
+		{ RE_CARET_ANCHORS_HERE,	"RE_CARET_ANCHORS_HERE" },
+		{ RE_CONTEXT_INVALID_DUP,	"RE_CONTEXT_INVALID_DUP" },
+		{ 0,				NULL }
+	};
+
+	return genflags2str(flags, regextab);
 }

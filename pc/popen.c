@@ -3,24 +3,16 @@
 #include <io.h>
 #include <string.h>
 #include <process.h>
-
-#ifdef OS2
-#ifdef _MSC_VER
-#define popen(c,m)   _popen(c,m)
-#define pclose(f)    _pclose(f)
-#endif
-#endif
-
-#if defined(WIN32) && defined(_MSC_VER)
-#define popen _popen
-#define pclose _pclose
-#endif
+#include <errno.h>
+#include "popen.h"
+#undef popen
+#undef pclose
+#undef system
 
 #ifndef _NFILE
 #define _NFILE 40
 #endif
 
-static char template[] = "piXXXXXX";
 static struct {
   char *command;
   char *name;
@@ -36,8 +28,12 @@ static struct {
  * Currently, only MSC (running under DOS) and MINGW versions are managed.
  */
 
-#if defined(_MSC_VER) || defined(__MINGW32__)
+#if defined(__MINGW32__)
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#if 0
 static int
 unixshell(char *p)
 {
@@ -87,8 +83,10 @@ scriptify(const char *command)
   slashify(name, p);
   if (! (i = unixshell(p))) {
     char *p = (char *) realloc(name, strlen(name) + 5);
-    if (p == NULL)
+    if (p == NULL) {
+	free(cmd);
 	return NULL;
+    }
     name = p;
     strcat(name, ".bat");
   }
@@ -98,10 +96,14 @@ scriptify(const char *command)
   if ((fp = fopen(p, i ? "wb" : "w")) != NULL) {
     if (! i) fputs("@echo off\n", fp);
     i = strlen(command);
-    if ((fwrite(command, 1, i, fp) < i) || (fputc('\n', fp) == EOF))
-      cmd = NULL; 
-  } else
+    if ((fwrite(command, 1, i, fp) < i) || (fputc('\n', fp) == EOF)) {
+      free(cmd);
+      cmd = NULL;
+    }
+  } else {
+    free(cmd);
     cmd = NULL;
+  }
   if (fp) fclose(fp); 
   return(cmd);
 }
@@ -117,57 +119,101 @@ unlink_and_free(char *cmd)
     s = cmd;
   unlink(s); free(cmd);
 }
+#endif
 
 int
 os_system(const char *cmd)
 {
-  char *s;
-  int i;
-  char *cmd1;
+  char *cmdexe = getenv("ComSpec");
+  char *cmd1 = quote_cmd(cmd);
+  int i = spawnl(P_WAIT, cmdexe, "cmd.exe", "/c", cmd1, NULL);
 
-#if defined(OS2)
-  if (_osmode == OS2_MODE)
-    return(system(cmd));
-#endif
-
-  if ((cmd1 = scriptify(cmd)) == NULL) return(1);
-  if (s = getenv("SHELL"))
-    i = spawnlp(P_WAIT, s, s, cmd1 + strlen(s), NULL);
-  else
-    i = system(cmd1);
-  unlink_and_free(cmd1);
+  free(cmd1);
   return(i);
 }
-#else
+
+#ifndef PIPES_SIMULATED
+int
+kill (int pid, int sig)
+{
+  HANDLE ph;
+  int retval = 0;
+
+  /* We only support SIGKILL.  */
+  if (sig != SIGKILL)
+    {
+      errno = ENOSYS;
+      return -1;
+    }
+
+  ph = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+  if (ph)
+    {
+      BOOL status = TerminateProcess(ph, -1);
+
+      if (!status)
+	{
+	  errno = EPERM;
+	  retval = -1;
+	}
+    }
+  else
+    {
+      /* If we cannot open the process, it means we eaither aren't
+	 allowed to (e.g., a process of another user), or such a
+	 process doesn't exist.  */
+      switch (GetLastError ())
+	{
+	  case ERROR_ACCESS_DENIED:
+	    errno = EPERM;
+	    break;
+	  default:
+	    errno = ESRCH;
+	    break;
+	}
+      retval = -1;
+    }
+  CloseHandle (ph);
+  return retval;
+}
+
+char *
+quote_cmd(const char *cmd)
+{
+  char *quoted;
+
+  /* The command will be invoked via cmd.exe, whose behavior wrt
+     quoted commands is to remove the first and the last quote
+     characters, and leave the rest (including any quote characters
+     inside the outer pair) intact.  */
+  quoted = malloc(strlen (cmd) + 2 + 1);
+  sprintf(quoted, "\"%s\"", cmd);
+
+  return quoted;
+}
+#endif
+
+#else  /* !__MINGW32__ */
 #define os_system(cmd) system(cmd)
 #endif
 
 
 FILE *
-os_popen(const char *command, char *mode )
+os_popen(const char *command, const char *mode )
 {
     FILE *current;
     char *name;
     int cur;
     char curmode[4];
-#if defined(__MINGW32__) || (defined(_MSC_VER) && defined(WIN32))
-    char *cmd;
-#endif
-    
-#if defined(OS2) && (_MSC_VER != 510)
-    if (_osmode == OS2_MODE)
-      return(popen(command, mode));
-#endif
 
     if (*mode != 'r' && *mode != 'w')
       return NULL;
     strncpy(curmode, mode, 3); curmode[3] = '\0';
 
-#if defined(__MINGW32__) || (defined(_MSC_VER) && defined(WIN32))
-    current = popen(cmd = scriptify(command), mode);
+#if defined(__MINGW32__)
+    current = popen(command, mode);
     cur = fileno(current);
     strcpy(pipes[cur].pmode, curmode);
-    pipes[cur].command = cmd;
     return(current);
 #endif
 
@@ -211,15 +257,9 @@ os_pclose( FILE * current)
     int cur = fileno(current);
     int fd, rval;
 
-#if defined(OS2) && (_MSC_VER != 510)
-    if (_osmode == OS2_MODE)
-      return(pclose(current));
-#endif
-
-#if defined(__MINGW32__) || (defined(_MSC_VER) && defined(WIN32))
+#if defined(__MINGW32__)
     rval = pclose(current);
     *pipes[cur].pmode = '\0';
-    unlink_and_free(pipes[cur].command);
     return rval;
 #endif
 

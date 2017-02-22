@@ -1,4 +1,4 @@
-# getopt.awk --- do C library getopt(3) function in awk
+# getopt.awk --- Do C library getopt(3) function in awk
 #
 # Arnold Robbins, arnold@skeeve.com, Public Domain
 #
@@ -13,11 +13,11 @@
 
 # Returns:
 #    -1     at end of options
-#    ?      for unrecognized option
+#    "?"    for unrecognized option
 #    <c>    a character representing the current option
 
 # Private Data:
-#    _opti  -- index in multi-flag option, e.g., -abc
+#    _opti  -- index in multiflag option, e.g., -abc
 function getopt(argc, argv, options,    thisopt, i)
 {
     if (length(options) == 0)    # no options given
@@ -27,7 +27,7 @@ function getopt(argc, argv, options,    thisopt, i)
         Optind++
         _opti = 0
         return -1
-    } else if (argv[Optind] !~ /^-[^: \t\n\f\r\v\b]/) {
+    } else if (argv[Optind] !~ /^-[^:[:space:]]/) {
         _opti = 0
         return -1
     }
